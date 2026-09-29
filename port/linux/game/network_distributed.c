@@ -19,7 +19,11 @@ rest as the host has it:
   (player_queues_new.c).
 - Every tick, a client sends the host where its own players' units are (it
   predicts them from its own input); the host takes that as they are,
-  within a tolerance, as later Halo engines do, at its next tick.
+  within a tolerance, as later Halo engines do, at its next tick. Under
+  host authority (network.authority "host", the default) it does not: the
+  host moves every player by their input alone, and a client compares the
+  host's word on its own player with where it had predicted it after the
+  same input, and moves it by the difference (reconciliation).
 - Every tick, the host sends every client every player's unit: which unit
   the player has, alive or not, the seat it rides, its shields and health
   (down, recharging, the damage they show), and where it is (dead: who
@@ -72,6 +76,11 @@ short network_distributed_server_machines(long *machine_indices, short maximum);
 void network_player_attach_unit(long player_index, long unit_index);
 void network_player_detach_unit(long player_index);
 void network_player_show_pickup(long player_index, short kind, long definition_index, short count);
+/* port_config.c's */
+char const *config_string(char const *name);
+#ifndef HALO_RELEASE
+double config_real(char const *name);
+#endif
 /* game_engine.c's */
 long game_engine_write_network_state(byte *buffer, long size);
 void game_engine_read_network_state(byte const *buffer, long size);
@@ -112,6 +121,10 @@ enum
 	_distributed_unit_shield_depleted_bit,
 	_distributed_unit_shield_charging_bit,
 	_distributed_unit_shield_over_charging_bit,
+	/* the host decides where its clients' players are from their input
+	alone (network.authority): input_tick is the client's tick the position
+	is the result of */
+	_distributed_unit_host_authority_bit,
 };
 
 /* struct distributed_unit_state unit flags */
@@ -129,6 +142,18 @@ good, the host's player somewhere its own is not) */
 #define HOST_ACCEPT_TOLERANCE 3.5f
 #define REMOTE_CORRECTION_TOLERANCE 0.05f
 #define LOCAL_CORRECTION_TOLERANCE 3.0f
+/* (host authority) how far the host's word on a client's own player's unit
+may be from where the client had predicted it after the same input before
+the client moves it by the difference (the host runs the same input, but
+not always at the same ticks: one late is held a tick) */
+#define RECONCILE_TOLERANCE 0.02f
+
+enum
+{
+	/* (host authority) the ticks of a client's own players' predicted
+	positions kept, a power of two (about two seconds) */
+	PREDICTION_HISTORY_TICKS = 64,
+};
 
 /* how far players are from a client's own (world units) before the host
 sends them to it (their units and their input) every second tick, every
@@ -172,7 +197,9 @@ struct distributed_unit_state
 	struct distributed_vector velocity;
 	struct distributed_vector forward;
 	struct distributed_vector up;
-	short pad1;
+	/* (host authority) the low 16 bits of the latest tick of the client's
+	input for the player that the host had run */
+	short input_tick;
 	/* (VITALITY_SCALE) */
 	word body_vitality;
 	word shield_vitality;
@@ -286,6 +313,18 @@ static struct
 	boolean valid;
 	struct distributed_unit_state state;
 } distributed_predictions[MAXIMUM_TRACKED_PLAYERS];
+/* a client: whether its host decides where every player is
+(_distributed_unit_host_authority_bit) */
+static boolean distributed_host_authority_seen;
+/* ... then where each of its own players' units, and the vehicles they
+drive, were after each tick of input, by the input's tick */
+static struct distributed_predicted_position
+{
+	boolean valid;
+	long tick;
+	long object_index;
+	real_point3d position;
+} distributed_prediction_history[MAXIMUM_LOCAL_PLAYERS][NUMBER_OF_PREDICTION_KINDS][PREDICTION_HISTORY_TICKS];
 /* the host: what each player's unit was last sent as (a change goes to
 every client at once) */
 static struct
@@ -327,6 +366,10 @@ static struct
 	long sent;
 	long received;
 	long corrections;
+	/* (the host) client position reports ignored under host authority;
+	(a client) its own players moved by the host's word */
+	long ignored_predictions;
+	long reconciliations;
 } distributed_statistics;
 
 /* ---------- shared (network_distributed.h) */
@@ -339,6 +382,44 @@ void network_distributed_statistics(
 	*sent = distributed_statistics.sent;
 	*received = distributed_statistics.received;
 	*corrections = distributed_statistics.corrections;
+}
+
+void network_distributed_authority_statistics(
+	long *ignored_predictions,
+	long *reconciliations)
+{
+	*ignored_predictions = distributed_statistics.ignored_predictions;
+	*reconciliations = distributed_statistics.reconciliations;
+}
+
+void distributed_count_ignored_prediction(
+	void)
+{
+	distributed_statistics.ignored_predictions++;
+}
+
+boolean network_distributed_host_authority(
+	void)
+{
+	static short host_authority = NONE;
+
+	if (game_connection() != _game_connection_network_server)
+		return distributed_host_authority_seen;
+	if (host_authority == NONE)
+		host_authority = csstrcmp(config_string("network.authority"), "client") != 0;
+	return host_authority;
+}
+
+boolean distributed_player_input_tick(
+	short player_index,
+	short *input_tick)
+{
+	long tick;
+
+	if (!update_server_distributed_input_tick(player_index, &tick))
+		return FALSE;
+	*input_tick = (short)(tick & 0xFFFF);
+	return TRUE;
 }
 
 void distributed_count_sent(
@@ -728,6 +809,13 @@ static void distributed_state_from_player(
 		camouflage = camouflage > 1.0f ? 1.0f : camouflage < 0.0f ? 0.0f : camouflage;
 		state->active_camouflage = (byte)(long)floor(camouflage * 255.0f + 0.5f);
 	}
+	/* (the host) where it has the player is its own doing, of the client's
+	input up to this tick of it */
+	if (game_connection() == _game_connection_network_server && network_distributed_host_authority())
+	{
+		SET_FLAG(state->flags, _distributed_unit_host_authority_bit, TRUE);
+		distributed_player_input_tick(player_index, &state->input_tick);
+	}
 	state->killing_player_index = NO_PLAYER;
 	if (unit_index == NONE && player_index < MAXIMUM_TRACKED_PLAYERS && distributed_deaths[player_index].valid)
 	{
@@ -774,7 +862,15 @@ static void distributed_client_send_predictions(
 	struct data_iterator iterator;
 	struct player_datum *player;
 	short count = 0;
+#ifndef HALO_RELEASE
+	real cheat_step = (real)config_real("debug.cheat_movement_step");
+#else
+	real cheat_step = 0.0f;
+#endif
 
+	/* (a host that decides where every player is has no use for them) */
+	if (distributed_host_authority_seen && cheat_step <= 0.0f)
+		return;
 	data_iterator_new(&iterator, player_data);
 	while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL &&
 		count < MAXIMUM_UNIT_STATES_PER_MESSAGE)
@@ -788,7 +884,20 @@ static void distributed_client_send_predictions(
 			continue;
 		}
 		distributed_state_from_player((short)DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index),
-			&message.states[count++]);
+			&message.states[count]);
+#ifndef HALO_RELEASE
+		/* (the red-team client of stage H1: each report a step ahead of
+		where the unit is, along its facing, which a host that takes reports
+		within its tolerance puts it; debug builds only) */
+		if (cheat_step > 0.0f)
+		{
+			struct object_datum *object = object_get(unit_index);
+
+			message.states[count].position.x += object->object.forward.i * cheat_step;
+			message.states[count].position.y += object->object.forward.j * cheat_step;
+		}
+#endif
+		count++;
 	}
 	if (count)
 	{
@@ -806,6 +915,13 @@ static void distributed_handle_predictions(
 {
 	short index;
 
+	/* (host authority: where a client says its player is counts for
+	nothing; the host moved it by its input) */
+	if (network_distributed_host_authority())
+	{
+		distributed_statistics.ignored_predictions += count;
+		return;
+	}
 	for (index = 0; index < count; index++)
 	{
 		struct distributed_unit_state const *state = &states[index];
@@ -849,6 +965,113 @@ static void distributed_apply_predictions(
 	}
 }
 
+/* (a client, host authority) where each of its own players' units, or the
+vehicles they drive, are after the tick of input just sent */
+static void distributed_record_predictions(
+	void)
+{
+	short local_player_index;
+
+	for (local_player_index = 0; local_player_index < MAXIMUM_LOCAL_PLAYERS; local_player_index++)
+	{
+		long player_index = local_player_get_player_index(local_player_index);
+		struct player_datum *player = player_index != NONE ? player_try_and_get(player_index) : NULL;
+		long unit_index = player ? distributed_living_unit(player) : NONE;
+		long object_index = unit_index;
+		short kind = _prediction_unit;
+		struct player_action action;
+		unsigned short control_flags[DISTRIBUTED_INPUT_HISTORY];
+		struct distributed_predicted_position *entry;
+		long tick;
+
+		if (unit_index == NONE ||
+			!update_client_distributed_input(local_player_index, &tick, &action, control_flags))
+		{
+			continue;
+		}
+		if (object_get(unit_index)->object.parent_object_index != NONE)
+		{
+			struct unit_datum *vehicle = (struct unit_datum *)object_try_and_get_and_verify_type(
+				object_get(unit_index)->object.parent_object_index, _object_mask_vehicle);
+
+			if (!vehicle || vehicle->unit.driver_object_index != unit_index ||
+				vehicle->object.parent_object_index != NONE)
+			{
+				continue;
+			}
+			object_index = object_get(unit_index)->object.parent_object_index;
+			kind = _prediction_vehicle;
+		}
+		entry = &distributed_prediction_history[local_player_index][kind][tick & (PREDICTION_HISTORY_TICKS - 1)];
+		entry->valid = TRUE;
+		entry->tick = tick;
+		entry->object_index = object_index;
+		entry->position = object_get(object_index)->object.position;
+	}
+}
+
+boolean distributed_reconcile(
+	short local_player_index,
+	short kind,
+	long object_index,
+	short input_tick,
+	real_point3d const *host_position)
+{
+	struct distributed_predicted_position *history;
+	struct distributed_predicted_position *predicted = NULL;
+	struct object_datum *object = object_get(object_index);
+	real_vector3d error;
+	real_point3d position;
+	real distance_squared;
+	short index;
+
+	if (local_player_index < 0 || local_player_index >= MAXIMUM_LOCAL_PLAYERS || kind < 0 ||
+		kind >= NUMBER_OF_PREDICTION_KINDS)
+	{
+		return FALSE;
+	}
+	history = distributed_prediction_history[local_player_index][kind];
+	for (index = 0; index < PREDICTION_HISTORY_TICKS; index++)
+	{
+		if (history[index].valid && history[index].object_index == object_index &&
+			(short)(history[index].tick & 0xFFFF) == input_tick)
+		{
+			predicted = &history[index];
+			break;
+		}
+	}
+	if (!predicted)
+		return FALSE;
+	error.i = host_position->x - predicted->position.x;
+	error.j = host_position->y - predicted->position.y;
+	error.k = host_position->z - predicted->position.z;
+	distance_squared = error.i * error.i + error.j * error.j + error.k * error.k;
+	if (distance_squared <= RECONCILE_TOLERANCE * RECONCILE_TOLERANCE)
+		return TRUE;
+	/* (far off, a respawn or a teleport: nothing predicted before counts) */
+	if (distance_squared > LOCAL_CORRECTION_TOLERANCE * LOCAL_CORRECTION_TOLERANCE)
+	{
+		csmemset(history, 0, sizeof(distributed_prediction_history[0][0]));
+		return FALSE;
+	}
+	position.x = object->object.position.x + error.i;
+	position.y = object->object.position.y + error.j;
+	position.z = object->object.position.z + error.k;
+	network_objects_correct(object_index, &position, &object->object.forward, &object->object.up, NULL, NULL);
+	for (index = 0; index < PREDICTION_HISTORY_TICKS; index++)
+	{
+		if (history[index].valid && history[index].object_index == object_index &&
+			history[index].tick - predicted->tick >= 0)
+		{
+			history[index].position.x += error.i;
+			history[index].position.y += error.j;
+			history[index].position.z += error.k;
+		}
+	}
+	distributed_statistics.reconciliations++;
+	return TRUE;
+}
+
 /* (a client) the host's word on every player's unit */
 static void distributed_handle_unit_states(
 	struct distributed_unit_state const *states,
@@ -865,6 +1088,8 @@ static void distributed_handle_unit_states(
 		boolean alive = TEST_FLAG(state->flags, _distributed_unit_alive_bit);
 		boolean local;
 
+		if (TEST_FLAG(state->flags, _distributed_unit_host_authority_bit))
+			distributed_host_authority_seen = TRUE;
 		if (!player)
 			continue;
 		player_index = DATUM_INDEX_NEW(state->player_index, player->identifier);
@@ -955,7 +1180,13 @@ static void distributed_handle_unit_states(
 		if (TEST_FLAG(state->flags, _distributed_unit_placed_bit) &&
 			object_get(unit_index)->object.parent_object_index == NONE)
 		{
-			if (local)
+			if (local && TEST_FLAG(state->flags, _distributed_unit_host_authority_bit) &&
+				distributed_reconcile(player->local_player_index, _prediction_unit, unit_index, state->input_tick,
+					&state->position))
+			{
+				/* (moved by the host's word, if at all) */
+			}
+			else if (local)
 				distributed_apply_state(unit_index, state, LOCAL_CORRECTION_TOLERANCE, 0.0f);
 			else
 				distributed_apply_state(unit_index, state, REMOTE_CORRECTION_TOLERANCE, REMOTE_BLEND_DISTANCE);
@@ -1588,6 +1819,8 @@ void network_distributed_new_game(
 			distributed_received_times[sender][type] = NONE;
 	}
 	distributed_host_time = NONE;
+	distributed_host_authority_seen = FALSE;
+	csmemset(distributed_prediction_history, 0, sizeof(distributed_prediction_history));
 	distributed_statistics_due = FALSE;
 	distributed_pickup_count = 0;
 	network_objects_new_game();
@@ -1625,6 +1858,7 @@ void network_distributed_tick(
 	else if (connection == _game_connection_network_client)
 	{
 		distributed_client_send_inputs();
+		distributed_record_predictions();
 		distributed_client_send_predictions();
 		network_objects_client_tick();
 		network_damage_client_tick();

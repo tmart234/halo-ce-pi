@@ -58,6 +58,8 @@ void platform_log(char const *format, ...);
 void damage_kill_object_for_player(long object_index, long player_index);
 /* network_distributed.c's */
 void network_distributed_statistics(long *sent, long *received, long *corrections);
+void network_distributed_authority_statistics(long *ignored_predictions, long *reconciliations);
+boolean network_distributed_host_authority(void);
 void network_distributed_item_statistics(long *creates, long *deletes, long *failures, long *removed);
 void network_damage_statistics(long *sent_reports, long *dealt_reports, long *rejected_reports, long *replayed_events);
 /* xinput_sdl.c's */
@@ -202,14 +204,17 @@ static void network_test_log_players(
 		long creates, deletes, failures, removed;
 
 		long sent_reports, dealt_reports, rejected_reports, replayed_events;
+		long ignored_predictions, reconciliations;
 
 		network_distributed_item_statistics(&creates, &deletes, &failures, &removed);
 		network_damage_statistics(&sent_reports, &dealt_reports, &rejected_reports, &replayed_events);
+		network_distributed_authority_statistics(&ignored_predictions, &reconciliations);
 		platform_log("network test: tick %ld%s | items %ld (+%ld -%ld !%ld x%ld) | %s | sent %ld received %ld corrected %ld"
-			" | hits %ld dealt %ld rejected %ld replayed %ld",
+			" | hits %ld dealt %ld rejected %ld replayed %ld | authority %s ignored %ld reconciled %ld",
 			game_time_get(), line, ground_items, creates, deletes, failures, removed,
 			game_engine_can_score() ? "playing" : "game over", sent, received, corrections,
-			sent_reports, dealt_reports, rejected_reports, replayed_events);
+			sent_reports, dealt_reports, rejected_reports, replayed_events,
+			network_distributed_host_authority() ? "host" : "client", ignored_predictions, reconciliations);
 	}
 }
 

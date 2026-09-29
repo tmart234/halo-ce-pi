@@ -1100,6 +1100,19 @@ void update_server_handle_distributed_input(
 	queue->current_action = *action;
 }
 
+boolean update_server_distributed_input_tick(
+	long absolute_index,
+	long *tick)
+{
+	if (absolute_index < 0 || absolute_index >= MAXIMUM_NUMBER_OF_PLAYERS ||
+		!update_server_distributed_inputs[absolute_index].valid)
+	{
+		return FALSE;
+	}
+	*tick = update_server_distributed_inputs[absolute_index].tick;
+	return TRUE;
+}
+
 long update_server_ticked_update_number(
 	void)
 {

@@ -47,7 +47,58 @@ update"), and stays in the list of games. Version 1 was the first of this
 netcode; version 2 lets a machine join a game in progress; version 3 puts
 each player in its slot of the host's player list on every machine;
 version 4 plays the European (PAL) maps as the North American ones
-(`port/linux/game/pal_tags.c`).
+(`port/linux/game/pal_tags.c`); version 5 adds host authority (below).
+
+## Host authority
+
+The game's own model trusts each client's word on where its own player is.
+The host accepts a client's reported position if it is within 3.5 world
+units of the host's copy, and then snaps to it. The next report is measured
+from there, so a modified client can move 3.5 units a tick further than
+physics allows, and through walls. `network.authority = "host"` (the
+default; the host's setting applies) closes this. It is the server
+authority of the `mmo` framework's Fair-Play Protocol ("don't trust, don't
+send"):
+
+- **The host ignores reports.** It moves every player, and every vehicle a
+  player drives, from that player's input only (the input it already
+  simulates each tick). It drops the players' and vehicles' position
+  reports and counts them (`ignored` in the test report).
+- **Each state carries the input tick it follows from.** In every unit
+  state (`input_tick`, formerly padding) and in every state of a vehicle
+  that a client's player drives, the host puts the low 16 bits of the
+  latest tick of that player's input that it has run. A flag bit says the
+  host is authoritative. A client learns it from these states, then stops
+  sending position reports.
+- **Clients reconcile.** A client keeps where its own unit (or the vehicle
+  it drives) was after each of its last 64 ticks of input. When the host's
+  state for input tick *t* arrives, the difference between the host's
+  position and the client's prediction at *t* is the client's error. The
+  client moves its unit by that error, drawn gliding
+  (`network_objects_correct`), and shifts its predictions after *t* by the
+  same amount so the error is not corrected twice. Errors under 0.02 world
+  units are ignored. An error over 3 units (a respawn, a teleport), or a
+  tick the client no longer has, falls back to the old correction: put
+  where the host has it.
+
+The price is the one every server-authoritative shooter pays. When a
+client's input reaches the host late, the host runs its previous input for
+that tick, and the client is corrected by the difference. The reconciliation
+keeps the correction small and smooth, but a host-side input buffer (the
+next step) would remove most of it. Shooter's hits are still the client's,
+checked by the host (`network_damage.c`). A path check on them is the next
+step of the same work.
+
+`debug.cheat_movement_step` (debug builds) is the red-team client that
+proves the gap and the fix. Its reports run the given number of units
+ahead of its player. Against `network.authority = "client"`, a step under
+3.5 moves the player that far each tick. Against `"host"`, the reports are
+ignored:
+
+```bash
+HALO_NET_AUTHORITY=client HALO_NETWORK_TEST=host:bloodgulch ./halo &
+HALO_CHEAT_MOVEMENT_STEP=3.0 HALO_TEST_INPUT=bot:1 HALO_NETWORK_TEST=join ./halo
+```
 
 ## Joining a game in progress
 

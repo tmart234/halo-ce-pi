@@ -113,6 +113,12 @@ static const struct config_setting config_settings[] =
 		"player's own moves and lets the host decide the rest; \"lockstep\" plays\n"
 		"system link as the Xbox game did. The host's is played: a machine that\n"
 		"joins a game plays its host's." },
+	{ "network.authority", _config_string, "\"host\"", "HALO_NET_AUTHORITY", _environment_value, _platform_all,
+		"(distributed netcode, the host's) \"host\" moves every player and the\n"
+		"vehicles they drive by their input alone, and each client reconciles its\n"
+		"prediction with the host's word; \"client\" also takes where a client\n"
+		"says its own player is, within a tolerance (as later Halo engines do,\n"
+		"and open to a modified client). Refer to NETCODE.md." },
 	{ "network.online", _config_boolean, "true", "HALO_NET_ONLINE", _environment_value, _platform_all,
 		"Internet play: hosting makes an invite link (logged, and put on the\n"
 		"clipboard) that lets whoever has it join over the internet; opening a\n"
@@ -170,6 +176,9 @@ static const struct config_setting config_settings[] =
 		"machines of twice it), to test the netcode as over the internet; 0 none." },
 	{ "debug.network_loss", _config_real, "0.0", "HALO_NETWORK_LOSS", _environment_value, _platform_all,
 		"Percent of datagrams received that are dropped, for the same; 0 none." },
+	{ "debug.cheat_movement_step", _config_real, "0.0", "HALO_CHEAT_MOVEMENT_STEP", _environment_value, _platform_all,
+		"(debug builds only: a red-team client for tests) world units each of this\n"
+		"client's reports of where its own player is runs ahead of it; 0 none." },
 	{ "debug.test_input", _config_string, "\"\"", "HALO_TEST_INPUT", _environment_value, _platform_all,
 		"\"bot:<seed>\" plays controller 1 with a scripted pattern (automated\n"
 		"network tests); empty for none." },
