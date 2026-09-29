@@ -285,6 +285,30 @@ static struct
 	long tick;
 } update_server_distributed_inputs[MAXIMUM_NUMBER_OF_PLAYERS];
 
+/* ... the host: each client machine's player's actions come in and not yet
+run, oldest first (a jitter buffer: two that arrive between two of the
+host's ticks are run on two ticks, not the second alone), and the tick of
+the one it ran last, which it tells the client its position is the result
+of (network_distributed.c) */
+enum
+{
+	DISTRIBUTED_INPUT_BUFFER = 8,
+	/* more than this many waiting: drop the oldest, so a burst does not
+	leave the player that far behind for good */
+	DISTRIBUTED_INPUT_BUFFER_DEPTH = 2,
+};
+static struct
+{
+	short count;
+	struct
+	{
+		long tick;
+		struct player_action action;
+	} entries[DISTRIBUTED_INPUT_BUFFER];
+	boolean ran;
+	long ran_tick;
+} update_server_input_buffers[MAXIMUM_NUMBER_OF_PLAYERS];
+
 /* ... a client: each local player's last tick, its action, and the buttons
 of the ticks up to it, newest first */
 static struct
@@ -428,6 +452,28 @@ void update_server_next_update(
 			update_server_pending_control_flags[queue_index] = 0;
 			update->update.action_count += 1;
 			continue;
+		}
+#endif
+#ifdef HALO_LINUX
+		/* (a client machine's player: its next buffered action, or the last
+		one again if none has come) */
+		{
+			short count = update_server_input_buffers[queue_index].count;
+
+			if (count > 0)
+			{
+				short skip = count > DISTRIBUTED_INPUT_BUFFER_DEPTH + 1 ?
+					count - (DISTRIBUTED_INPUT_BUFFER_DEPTH + 1) : 0;
+
+				queue->current_action = update_server_input_buffers[queue_index].entries[skip].action;
+				update_server_input_buffers[queue_index].ran = TRUE;
+				update_server_input_buffers[queue_index].ran_tick =
+					update_server_input_buffers[queue_index].entries[skip].tick;
+				csmemmove(&update_server_input_buffers[queue_index].entries[0],
+					&update_server_input_buffers[queue_index].entries[skip + 1],
+					(count - skip - 1) * sizeof(update_server_input_buffers[queue_index].entries[0]));
+				update_server_input_buffers[queue_index].count = (short)(count - skip - 1);
+			}
 		}
 #endif
 		csmemcpy(
@@ -952,6 +998,7 @@ void update_queues_reset_and_fill_with_lies(
 	csmemset(update_server_pending_control_flags, 0, sizeof(update_server_pending_control_flags));
 	csmemset(update_client_relayed_actions, 0, sizeof(update_client_relayed_actions));
 	csmemset(update_server_distributed_inputs, 0, sizeof(update_server_distributed_inputs));
+	csmemset(update_server_input_buffers, 0, sizeof(update_server_input_buffers));
 	csmemset(update_client_local_inputs, 0, sizeof(update_client_local_inputs));
 #endif
 	if (update_server_globals.initialized)
@@ -1097,7 +1144,35 @@ void update_server_handle_distributed_input(
 	{
 		return;
 	}
-	queue->current_action = *action;
+	/* (run at the host's next tick with none before it waiting: in the
+	buffer, dropping the oldest if it is full) */
+	{
+		short count = update_server_input_buffers[absolute_index].count;
+
+		if (count == DISTRIBUTED_INPUT_BUFFER)
+		{
+			csmemmove(&update_server_input_buffers[absolute_index].entries[0],
+				&update_server_input_buffers[absolute_index].entries[1],
+				(DISTRIBUTED_INPUT_BUFFER - 1) * sizeof(update_server_input_buffers[absolute_index].entries[0]));
+			count--;
+		}
+		update_server_input_buffers[absolute_index].entries[count].tick = tick;
+		update_server_input_buffers[absolute_index].entries[count].action = *action;
+		update_server_input_buffers[absolute_index].count = (short)(count + 1);
+	}
+}
+
+boolean update_server_distributed_input_tick(
+	long absolute_index,
+	long *tick)
+{
+	if (absolute_index < 0 || absolute_index >= MAXIMUM_NUMBER_OF_PLAYERS ||
+		!update_server_input_buffers[absolute_index].ran)
+	{
+		return FALSE;
+	}
+	*tick = update_server_input_buffers[absolute_index].ran_tick;
+	return TRUE;
 }
 
 long update_server_ticked_update_number(

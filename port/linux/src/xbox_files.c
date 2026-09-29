@@ -982,3 +982,32 @@ BOOL WINAPI FindNextFileA(HANDLE find_file, LPWIN32_FIND_DATAA data)
 }
 
 /* FindClose is an XDK macro for CloseHandle */
+
+/* appends one line to signals.jsonl in the data root, beside debug.txt: the
+host's structured Signals for detection (port/linux/game/network_signals.c).
+Called from the game's thread only. */
+void platform_append_signal(const char *line)
+{
+	static FILE *file;
+	static int failed;
+
+	if (!file && !failed)
+	{
+		char path[MAX_PATH];
+
+		snprintf(path, sizeof(path), "%s/signals.jsonl", platform_data_root());
+		file = fopen(path, "a");
+		if (!file)
+		{
+			failed = 1;
+			platform_log("could not open %s for the host's signals", path);
+			return;
+		}
+	}
+	if (file)
+	{
+		fputs(line, file);
+		fputc('\n', file);
+		fflush(file);
+	}
+}

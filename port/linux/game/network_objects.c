@@ -92,6 +92,9 @@ enum
 	/* an item in a unit's inventory, not in the world */
 	_distributed_object_carried_bit = 0,
 	_distributed_object_at_rest_bit,
+	/* (a state) a vehicle a client's player drives, where the host drove it
+	by that player's input (host authority): input_tick is of it */
+	_distributed_object_host_authority_bit,
 };
 
 struct distributed_object_change
@@ -117,7 +120,10 @@ struct distributed_object_state
 {
 	long object_index;
 	byte flags;
-	byte pad[3];
+	byte pad;
+	/* (_distributed_object_host_authority_bit) the low 16 bits of the tick
+	of its driver's client's input the host had run, little-endian */
+	byte input_tick[2];
 	real_point3d position;
 	struct distributed_vector forward;
 	struct distributed_vector up;
@@ -393,6 +399,25 @@ static void distributed_state_from_object(
 		&state->translational_velocity);
 	distributed_vector_pack(&object->object.angular_velocity, DISTRIBUTED_ANGULAR_VELOCITY_SCALE,
 		&state->angular_velocity);
+	/* (the host) a vehicle a client's player drives: of which tick of that
+	player's input */
+	if (game_connection() == _game_connection_network_server && object->object.type == _object_type_vehicle &&
+		network_distributed_host_authority())
+	{
+		struct unit_datum *vehicle = unit_get(object_index);
+		short input_tick;
+
+		if (vehicle->unit.driver_object_index != NONE &&
+			unit_get(vehicle->unit.driver_object_index)->unit.player_index != NONE &&
+			distributed_player_input_tick(
+				(short)DATUM_INDEX_TO_ABSOLUTE_INDEX(unit_get(vehicle->unit.driver_object_index)->unit.player_index),
+				&input_tick))
+		{
+			SET_FLAG(state->flags, _distributed_object_host_authority_bit, TRUE);
+			state->input_tick[0] = (byte)(input_tick & 0xFF);
+			state->input_tick[1] = (byte)((input_tick >> 8) & 0xFF);
+		}
+	}
 }
 
 /* the vehicle the player's unit drives, or NONE */
@@ -736,6 +761,13 @@ void network_objects_handle_vehicle_prediction(
 	struct distributed_object_state const *states = (struct distributed_object_state const *)entries;
 	short index;
 
+	/* (host authority: the host drove it by its driver's input) */
+	if (network_distributed_host_authority())
+	{
+		for (index = 0; index < count; index++)
+			distributed_count_ignored_prediction();
+		return;
+	}
 	for (index = 0; index < count; index++)
 	{
 		struct distributed_object_state const *state = &states[index];
@@ -1029,7 +1061,8 @@ void network_objects_handle_states(
 		{
 			continue;
 		}
-		/* (a vehicle this machine's own player drives is its own) */
+		/* (a vehicle this machine's own player drives is its own; under host
+		authority, where the host drove it by that player's input) */
 		if (object->object.type == _object_type_vehicle)
 		{
 			struct unit_datum *vehicle = unit_get(state->object_index);
@@ -1038,6 +1071,17 @@ void network_objects_handle_states(
 			if (vehicle->unit.driver_object_index != NONE &&
 				distributed_player_is_local(unit_get(vehicle->unit.driver_object_index)->unit.player_index))
 			{
+				struct player_datum *driver = player_try_and_get(
+					unit_get(vehicle->unit.driver_object_index)->unit.player_index);
+
+				if (TEST_FLAG(state->flags, _distributed_object_host_authority_bit) && driver &&
+					distributed_reconcile(driver->local_player_index, _prediction_vehicle, state->object_index,
+						(short)(state->input_tick[0] | (state->input_tick[1] << 8)), &state->position))
+				{
+					SET_FLAG(object->object.flags, _object_at_rest_bit,
+						TEST_FLAG(state->flags, _distributed_object_at_rest_bit));
+					continue;
+				}
 				tolerance = LOCAL_VEHICLE_TOLERANCE;
 				blend_distance = 0.0f;
 			}
@@ -1193,6 +1237,9 @@ static void distributed_client_send_vehicles(
 	struct player_datum *player;
 	short count = 0;
 
+	/* (a host that decides where every player is has no use for them) */
+	if (network_distributed_host_authority())
+		return;
 	data_iterator_new(&iterator, player_data);
 	while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL && count < MAXIMUM_LOCAL_PLAYERS)
 	{

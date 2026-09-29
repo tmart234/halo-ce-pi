@@ -47,7 +47,111 @@ update"), and stays in the list of games. Version 1 was the first of this
 netcode; version 2 lets a machine join a game in progress; version 3 puts
 each player in its slot of the host's player list on every machine;
 version 4 plays the European (PAL) maps as the North American ones
-(`port/linux/game/pal_tags.c`).
+(`port/linux/game/pal_tags.c`); version 5 adds host authority (below).
+
+## Host authority
+
+The game's own model trusts each client's word on where its own player is.
+The host accepts a client's reported position if it is within 3.5 world
+units of the host's copy, and then snaps to it. The next report is measured
+from there, so a modified client can move 3.5 units a tick further than
+physics allows, and through walls. `network.authority = "host"` (the
+default; the host's setting applies) closes this. It is the server
+authority of the `mmo` framework's Fair-Play Protocol ("don't trust, don't
+send"):
+
+- **The host ignores reports.** It moves every player, and every vehicle a
+  player drives, from that player's input only (the input it already
+  simulates each tick). It drops the players' and vehicles' position
+  reports and counts them (`ignored` in the test report).
+- **Each state carries the input tick it follows from.** In every unit
+  state (`input_tick`, formerly padding) and in every state of a vehicle
+  that a client's player drives, the host puts the low 16 bits of the
+  latest tick of that player's input that it has run. A flag bit says the
+  host is authoritative. A client learns it from these states, then stops
+  sending position reports.
+- **Clients reconcile.** A client keeps where its own unit (or the vehicle
+  it drives) was after each of its last 64 ticks of input. When the host's
+  state for input tick *t* arrives, the difference between the host's
+  position and the client's prediction at *t* is the client's error. The
+  client moves its unit by that error, drawn gliding
+  (`network_objects_correct`), and shifts its predictions after *t* by the
+  same amount so the error is not corrected twice. Errors under 0.02 world
+  units are ignored. An error over 3 units (a respawn, a teleport), or a
+  tick the client no longer has, falls back to the old correction: put
+  where the host has it.
+
+The price is the one every server-authoritative shooter pays: the host
+runs a client's input when it arrives, not when the client ran it. A small
+**input buffer** on the host (`player_queues_new.c`) keeps that from costing
+inputs. Each of a client's actions waits in a queue, and each host tick runs
+the oldest one. Two actions that arrive between two host ticks run on two
+ticks, where before the second replaced the first. With none waiting, the
+last is run again. With more than three waiting, the oldest are dropped, so
+a burst does not leave the player behind for good. The input tick the host
+reports is the one it actually ran, so the client's reconciliation compares
+like with like. What remains is a late input: it runs a tick late, and the
+client is corrected by that tick's difference.
+
+Shooter's hits are still the client's, checked by the host
+(`network_damage.c`). The checks cover the player, a weapon they carry, the
+target where the host had it, the impact at the target and the fire rate.
+They now also include **a path through the level**. The host casts a ray
+from where it had the shooter's unit, at any of the last 32 ticks (about a
+second: a round trip and a projectile's flight, sampled every fourth tick),
+to the target, the damage's origin or its epicenter. The ray stops 0.25
+units short. A report passes if any such ray is clear. The ray tests only
+the level's solid one-sided surfaces. It ignores objects, invisible player
+clipping, breakable glass and two-sided fences and grates, which shots may
+pass. A shooter who had no line to the hit during the last second (a shot
+through a wall) is rejected. Area-of-effect damage is not path-tested:
+explosions reach round corners, and the engine obstructs their damage
+itself.
+
+### Signals
+
+Each rejection is also a **Signal**, a JSON line in `signals.jsonl` next to
+`debug.txt` (`port/linux/game/network_signals.c`), for detection to read:
+
+```json
+{"tick":1234,"kind":"hit_report_rejected","machine":2,"player":5,"reason":"obstructed","count":3}
+```
+
+Kinds and reasons:
+
+| Kind | Reasons |
+| --- | --- |
+| `hit_report_rejected` | `not_its_player`, `bad_target`, `weapon_not_carried`, `target_not_there`, `impact_off_target`, `obstructed`, `rate`, `bad_damage` |
+| `position_report_ignored` | `host_authority`: a machine kept sending position reports more than 3 seconds' worth after the host said it decides. A client of this version stops once it has the host's first state. |
+
+The host writes each machine's kind and reason at most once a second, with
+the count since its last line, so a modified client cannot flood the file.
+
+`debug.cheat_movement_step` (debug builds) is the red-team client that
+proves the gap and the fix. Its reports run the given number of units
+ahead of its player. Against `network.authority = "client"`, a step under
+3.5 moves the player that far each tick. Against `"host"`, the reports are
+ignored:
+
+```bash
+HALO_NET_AUTHORITY=client HALO_NETWORK_TEST=host:bloodgulch ./halo &
+HALO_CHEAT_MOVEMENT_STEP=3.0 HALO_TEST_INPUT=bot:1 HALO_NETWORK_TEST=join ./halo
+```
+
+`debug.cheat_wall_hits` (debug builds) is the same for shots.
+`debug.network_test_shoot` normally hits the next player only when the
+level leaves a line between them. With the cheat, it hits through walls,
+and the host rejects those hits as `obstructed`:
+
+```bash
+HALO_NETWORK_TEST=host:bloodgulch HALO_NETWORK_TEST_SHOOT=2 ./halo &
+HALO_CHEAT_WALL_HITS=1 HALO_TEST_INPUT=bot:1 HALO_NETWORK_TEST=join HALO_NETWORK_TEST_SHOOT=2 ./halo
+grep obstructed signals.jsonl
+```
+
+Without the cheat, a soak of scripted bots (with `debug.network_latency`
+and `debug.network_loss`) should show no rejected hits. Any rejected hit
+there is a false reject to fix.
 
 ## Joining a game in progress
 

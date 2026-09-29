@@ -136,6 +136,31 @@ long distributed_living_unit(struct player_datum const *player);
 boolean distributed_machine_has_player(long machine_index, short player_index);
 void distributed_count_sent(void);
 void distributed_count_correction(void);
+/* whether the host alone decides where the players and the vehicles they
+drive are, from their input (network.authority "host"): the host's own
+setting on the host; on a client, whether its host's unit states say so */
+boolean network_distributed_host_authority(void);
+/* (a client, host authority) what its predictions are kept of */
+enum
+{
+	_prediction_unit,
+	_prediction_vehicle,
+	NUMBER_OF_PREDICTION_KINDS
+};
+/* (a client, host authority) moves its own player's unit or the vehicle it
+drives by the difference between where the host has it after the client's
+tick of input (low 16 bits) and where this machine predicted it after that
+tick (and the predictions after that tick, which have the difference too);
+FALSE with no prediction of that tick, or one far off (a respawn, a
+teleport), for the caller to correct it as without host authority */
+boolean distributed_reconcile(short local_player_index, short kind, long object_index, short input_tick,
+	real_point3d const *host_position);
+/* (the host) the low 16 bits of the latest tick of the client's input the
+host has run for the player (absolute index); FALSE for none */
+boolean distributed_player_input_tick(short player_index, short *input_tick);
+/* (the host) a client's report of where its own player or vehicle is,
+ignored under host authority, for the tests' reports */
+void distributed_count_ignored_prediction(void);
 /* (the host) the client machines in the game, but for its own; their count */
 short distributed_client_machines(long *machine_indices, short maximum);
 /* (the host) how long a message takes that client and its answer back, in
@@ -176,6 +201,14 @@ boolean network_objects_reconcile(long object_index, real_point3d const *positio
 	real blend_distance);
 /* a unit in the vehicle's seat as the host has it (NONE: in none) */
 void network_objects_set_seat(long unit_index, long vehicle_index, short seat_index);
+
+/* ---------- prototypes/NETWORK_SIGNALS.C */
+
+/* (the host) a Signal: it rejected what a client machine claimed (kind, and
+reason, both string constants); written to signals.jsonl, at most once a
+second for each machine, kind and reason, with the count since */
+void network_signal(char const *kind, char const *reason, long machine_index, short player_index);
+void network_signals_new_game(void);
 
 /* ---------- prototypes/NETWORK_DAMAGE.C */
 
