@@ -79,8 +79,8 @@ void update_server_handle_distributed_input(
 	struct player_action const *action,
 	unsigned short const *control_flags,
 	short count);
-/* (the host) the latest tick of a client machine's player (absolute index)
-whose input it has taken; FALSE for none */
+/* (the host) the tick of a client machine's player's (absolute index) input
+its last tick ran (from the jitter buffer); FALSE for none */
 boolean update_server_distributed_input_tick(
 	long absolute_index,
 	long *tick);

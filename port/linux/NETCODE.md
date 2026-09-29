@@ -81,11 +81,17 @@ send"):
   tick the client no longer has, falls back to the old correction: put
   where the host has it.
 
-The price is the one every server-authoritative shooter pays. When a
-client's input reaches the host late, the host runs its previous input for
-that tick, and the client is corrected by the difference. The reconciliation
-keeps the correction small and smooth, but a host-side input buffer (the
-next step) would remove most of it.
+The price is the one every server-authoritative shooter pays: the host
+runs a client's input when it arrives, not when the client ran it. A small
+**input buffer** on the host (`player_queues_new.c`) keeps that from costing
+inputs. Each of a client's actions waits in a queue, and each host tick runs
+the oldest one. Two actions that arrive between two host ticks run on two
+ticks, where before the second replaced the first. With none waiting, the
+last is run again. With more than three waiting, the oldest are dropped, so
+a burst does not leave the player behind for good. The input tick the host
+reports is the one it actually ran, so the client's reconciliation compares
+like with like. What remains is a late input: it runs a tick late, and the
+client is corrected by that tick's difference.
 
 Shooter's hits are still the client's, checked by the host
 (`network_damage.c`). The checks cover the player, a weapon they carry, the
