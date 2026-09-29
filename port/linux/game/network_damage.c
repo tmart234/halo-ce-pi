@@ -32,6 +32,7 @@ being hit looks and feels like on the clients).
 #include "objects/objects.h"
 #include "objects/damage.h"
 #include "objects/damage_effect_definitions.h"
+#include "physics/collisions.h"
 #include "items/weapon_definitions.h"
 #include "items/projectile_definitions.h"
 #include "scenario/scenario.h"
@@ -77,6 +78,8 @@ enum
 	/* ... looked back over beyond a shooter's round trip (the frame drawn a
 	tick behind, the report's own tick) */
 	TARGET_HISTORY_SLACK_TICKS = 3,
+	/* the shooter's positions a path test tries: every fourth tick back */
+	PATH_HISTORY_STEP_TICKS = 4,
 };
 
 enum
@@ -104,6 +107,8 @@ far it moves in a few ticks: a client's copy runs a little ahead of the
 host's word on it) */
 #define REPORT_HISTORY_TOLERANCE 2.0f
 #define REPORT_HISTORY_LEAD_TICKS 3.0f
+/* world units short of a hit a path test stops (the hit is on a surface) */
+#define PATH_END_SLACK 0.25f
 
 /* the host's struct damage_data, as the other machines have it */
 struct distributed_damage
@@ -732,7 +737,80 @@ static void distributed_note_weapons(
 }
 
 /* whether the host takes the report */
-static boolean distributed_report_valid(
+/* the shooter's player's unit at a tick back (from the targets' history),
+FALSE when the host had none then */
+static boolean distributed_shooter_position(
+	short player_index,
+	long back,
+	real_point3d *position)
+{
+	long time = game_time_get() - back;
+	struct damage_history_tick const *tick = &damage_history[time & (TARGET_HISTORY_TICKS - 1)];
+
+	if (tick->time != time || tick->objects[player_index][0].object_index == NONE)
+		return FALSE;
+	*position = tick->objects[player_index][0].position;
+	return TRUE;
+}
+
+/* whether the level lets a shot from the shooter reach the hit: from where
+the host had the shooter's unit at one of the last ticks (a second: a
+round trip and a projectile's flight) to where it hit, the target, or the
+damage's origin, stopping a little short of it (the hit is on a surface).
+Only the structure is tested, its solid one-sided surfaces: no objects,
+invisible walls (player clipping), breakable surfaces (glass) or two-sided
+ones (fences, grates), which shots may pass. So a shot through a wall
+from a player who never had a line to the hit in that second fails. */
+static boolean distributed_path_clear(
+	short player_index,
+	struct distributed_hit_report const *report)
+{
+	unsigned long flags =
+		FLAG(_collision_test_structure_bit) |
+		FLAG(_collision_test_front_facing_surfaces_bit) |
+		FLAG(_collision_test_ignore_invisible_surfaces_bit) |
+		FLAG(_collision_test_ignore_breakable_surfaces_bit) |
+		FLAG(_collision_test_ignore_two_sided_surfaces_bit);
+	real_point3d const *ends[3];
+	long back;
+	boolean known = FALSE;
+
+	ends[0] = &report->target_position;
+	ends[1] = &report->damage.origin;
+	ends[2] = &report->damage.epicenter;
+	/* (every fourth tick: a second is 8 positions) */
+	for (back = 0; back < TARGET_HISTORY_TICKS; back += PATH_HISTORY_STEP_TICKS)
+	{
+		real_point3d shooter;
+		short end;
+
+		if (!distributed_shooter_position(player_index, back, &shooter))
+			continue;
+		known = TRUE;
+		for (end = 0; end < 3; end++)
+		{
+			struct collision_result collision;
+			real_vector3d vector;
+			real length;
+
+			vector.i = ends[end]->x - shooter.x;
+			vector.j = ends[end]->y - shooter.y;
+			vector.k = ends[end]->z - shooter.z;
+			length = (real)sqrt(vector.i * vector.i + vector.j * vector.j + vector.k * vector.k);
+			if (length <= PATH_END_SLACK)
+				return TRUE;
+			vector.i *= (length - PATH_END_SLACK) / length;
+			vector.j *= (length - PATH_END_SLACK) / length;
+			vector.k *= (length - PATH_END_SLACK) / length;
+			if (!collision_test_vector(flags, &shooter, &vector, NONE, &collision))
+				return TRUE;
+		}
+	}
+	/* (no history of the shooter yet: nothing to test against) */
+	return !known;
+}
+
+static char const *distributed_report_rejection(
 	long machine_index,
 	struct distributed_hit_report const *report)
 {
@@ -748,16 +826,16 @@ static boolean distributed_report_valid(
 	if (player_index == NO_PLAYER || player_index >= MAXIMUM_TRACKED_PLAYERS ||
 		!distributed_player(player_index) || !distributed_machine_has_player(machine_index, player_index))
 	{
-		return FALSE;
+		return "not_its_player";
 	}
 	/* one of the host's objects */
 	target = (struct object_datum *)object_try_and_get_and_verify_type(report->object_index,
 		_object_mask_biped | _object_mask_vehicle | _object_mask_weapon | _object_mask_equipment);
 	if (!target || !tag_index_is_group(report->damage.definition_index, DAMAGE_EFFECT_DEFINITION_TAG))
-		return FALSE;
+		return "bad_target";
 	/* damage that player could deal */
 	if (!distributed_player_deals(player_index, report->damage.definition_index))
-		return FALSE;
+		return "weapon_not_carried";
 	/* the target about where the host had it when the shooter saw it: a
 	player's unit or vehicle as far back as the shooter's round trip, else
 	(what no player has) about where it is */
@@ -767,7 +845,7 @@ static boolean distributed_report_valid(
 			MIN(ticks, TARGET_HISTORY_TICKS - 1));
 
 		if (seen == FALSE)
-			return FALSE;
+			return "target_not_there";
 		if (seen == NONE)
 		{
 			real_point3d origin;
@@ -781,7 +859,7 @@ static boolean distributed_report_valid(
 			dy = report->target_position.y - origin.y;
 			dz = report->target_position.z - origin.z;
 			if (dx * dx + dy * dy + dz * dz > tolerance * tolerance)
-				return FALSE;
+				return "target_not_there";
 		}
 	}
 	/* the impact at the target (an explosion's within its reach) */
@@ -798,7 +876,15 @@ static boolean distributed_report_valid(
 	dz = report->damage.epicenter.z - report->target_position.z;
 	impact_distance_squared = MIN(impact_distance_squared, dx * dx + dy * dy + dz * dz);
 	if (impact_distance_squared > reach * reach)
-		return FALSE;
+		return "impact_off_target";
+	/* a path the shot could take: no level geometry between where the
+	shooter was and where it hit (explosions reach round corners, and the
+	engine obstructs their damage itself) */
+	if (!TEST_FLAG(report->damage.flags, _damage_area_of_effect_bit) &&
+		!distributed_path_clear(player_index, report))
+	{
+		return "obstructed";
+	}
 	/* no more than any weapon fires */
 	{
 		real *hit_reports = &damage_players[player_index].hit_reports;
@@ -808,10 +894,10 @@ static boolean distributed_report_valid(
 			*hit_reports + (real)elapsed * HIT_REPORTS_PER_SECOND / TICKS_PER_SECOND);
 		damage_players[player_index].hit_reports_time = game_time_get();
 		if (*hit_reports < 1.0f)
-			return FALSE;
+			return "rate";
 		*hit_reports -= 1.0f;
 	}
-	return TRUE;
+	return NULL;
 }
 
 void network_damage_handle_reports(
@@ -827,9 +913,15 @@ void network_damage_handle_reports(
 		struct distributed_hit_report const *report = &reports[index];
 		struct damage_data damage;
 
-		if (!distributed_report_valid(machine_index, report) || !distributed_damage_to_data(&report->damage, &damage))
+		char const *rejection = distributed_report_rejection(machine_index, report);
+
+		if (!rejection && !distributed_damage_to_data(&report->damage, &damage))
+			rejection = "bad_damage";
+		if (rejection)
 		{
 			damage_rejected_reports++;
+			network_signal("hit_report_rejected", rejection, machine_index,
+				report->damage.owner_player_index != NO_PLAYER ? report->damage.owner_player_index : NONE);
 			continue;
 		}
 		damage_dealt_reports++;

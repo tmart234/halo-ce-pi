@@ -202,6 +202,14 @@ boolean network_objects_reconcile(long object_index, real_point3d const *positio
 /* a unit in the vehicle's seat as the host has it (NONE: in none) */
 void network_objects_set_seat(long unit_index, long vehicle_index, short seat_index);
 
+/* ---------- prototypes/NETWORK_SIGNALS.C */
+
+/* (the host) a Signal: it rejected what a client machine claimed (kind, and
+reason, both string constants); written to signals.jsonl, at most once a
+second for each machine, kind and reason, with the count since */
+void network_signal(char const *kind, char const *reason, long machine_index, short player_index);
+void network_signals_new_game(void);
+
 /* ---------- prototypes/NETWORK_DAMAGE.C */
 
 void network_damage_new_game(void);

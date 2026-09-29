@@ -179,6 +179,10 @@ static const struct config_setting config_settings[] =
 	{ "debug.cheat_movement_step", _config_real, "0.0", "HALO_CHEAT_MOVEMENT_STEP", _environment_value, _platform_all,
 		"(debug builds only: a red-team client for tests) world units each of this\n"
 		"client's reports of where its own player is runs ahead of it; 0 none." },
+	{ "debug.cheat_wall_hits", _config_boolean, "false", "HALO_CHEAT_WALL_HITS", _environment_set_is_true, _platform_all,
+		"(debug builds only: a red-team client for tests) debug.network_test_shoot\n"
+		"hits the next player with no line through the level between them, as a\n"
+		"wall-hack client would; the host rejects them (NETCODE.md)." },
 	{ "debug.test_input", _config_string, "\"\"", "HALO_TEST_INPUT", _environment_value, _platform_all,
 		"\"bot:<seed>\" plays controller 1 with a scripted pattern (automated\n"
 		"network tests); empty for none." },

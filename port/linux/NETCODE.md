@@ -85,9 +85,41 @@ The price is the one every server-authoritative shooter pays. When a
 client's input reaches the host late, the host runs its previous input for
 that tick, and the client is corrected by the difference. The reconciliation
 keeps the correction small and smooth, but a host-side input buffer (the
-next step) would remove most of it. Shooter's hits are still the client's,
-checked by the host (`network_damage.c`). A path check on them is the next
-step of the same work.
+next step) would remove most of it.
+
+Shooter's hits are still the client's, checked by the host
+(`network_damage.c`). The checks cover the player, a weapon they carry, the
+target where the host had it, the impact at the target and the fire rate.
+They now also include **a path through the level**. The host casts a ray
+from where it had the shooter's unit, at any of the last 32 ticks (about a
+second: a round trip and a projectile's flight, sampled every fourth tick),
+to the target, the damage's origin or its epicenter. The ray stops 0.25
+units short. A report passes if any such ray is clear. The ray tests only
+the level's solid one-sided surfaces. It ignores objects, invisible player
+clipping, breakable glass and two-sided fences and grates, which shots may
+pass. A shooter who had no line to the hit during the last second (a shot
+through a wall) is rejected. Area-of-effect damage is not path-tested:
+explosions reach round corners, and the engine obstructs their damage
+itself.
+
+### Signals
+
+Each rejection is also a **Signal**, a JSON line in `signals.jsonl` next to
+`debug.txt` (`port/linux/game/network_signals.c`), for detection to read:
+
+```json
+{"tick":1234,"kind":"hit_report_rejected","machine":2,"player":5,"reason":"obstructed","count":3}
+```
+
+Kinds and reasons:
+
+| Kind | Reasons |
+| --- | --- |
+| `hit_report_rejected` | `not_its_player`, `bad_target`, `weapon_not_carried`, `target_not_there`, `impact_off_target`, `obstructed`, `rate`, `bad_damage` |
+| `position_report_ignored` | `host_authority`: a machine kept sending position reports more than 3 seconds' worth after the host said it decides. A client of this version stops once it has the host's first state. |
+
+The host writes each machine's kind and reason at most once a second, with
+the count since its last line, so a modified client cannot flood the file.
 
 `debug.cheat_movement_step` (debug builds) is the red-team client that
 proves the gap and the fix. Its reports run the given number of units
@@ -99,6 +131,21 @@ ignored:
 HALO_NET_AUTHORITY=client HALO_NETWORK_TEST=host:bloodgulch ./halo &
 HALO_CHEAT_MOVEMENT_STEP=3.0 HALO_TEST_INPUT=bot:1 HALO_NETWORK_TEST=join ./halo
 ```
+
+`debug.cheat_wall_hits` (debug builds) is the same for shots.
+`debug.network_test_shoot` normally hits the next player only when the
+level leaves a line between them. With the cheat, it hits through walls,
+and the host rejects those hits as `obstructed`:
+
+```bash
+HALO_NETWORK_TEST=host:bloodgulch HALO_NETWORK_TEST_SHOOT=2 ./halo &
+HALO_CHEAT_WALL_HITS=1 HALO_TEST_INPUT=bot:1 HALO_NETWORK_TEST=join HALO_NETWORK_TEST_SHOOT=2 ./halo
+grep obstructed signals.jsonl
+```
+
+Without the cheat, a soak of scripted bots (with `debug.network_latency`
+and `debug.network_loss`) should show no rejected hits. Any rejected hit
+there is a false reject to fix.
 
 ## Joining a game in progress
 

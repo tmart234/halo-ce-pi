@@ -17,8 +17,10 @@ unit is, so the machines' views of the game can be compared.
 Scripted play for the netcode's parts the bots' wandering does not reach:
 debug.network_test_kill (the host kills the last player every so often),
 debug.network_test_shoot (every so often each machine's player hits the
-next with their weapon's projectile: a client's through its report to the
-host) and debug.network_test_vehicle (the host seats the last player as a
+next with their weapon's projectile, when the level leaves a line between
+them: a client's through its report to the host; debug.cheat_wall_hits, in
+debug builds, drops that line test, as a wall-hack client would, to show
+the host rejecting the hits) and debug.network_test_vehicle (the host seats the last player as a
 vehicle's driver that many seconds in, and takes them out 15 seconds on)
 and debug.network_test_pickup (the last player stands on a weapon lying
 about that many seconds in, and a joining machine's player holds the action
@@ -46,6 +48,7 @@ Called from the main loop every frame (main.c).
 #include "items/items.h"
 #include "objects/damage.h"
 #include "scenario/scenario.h"
+#include "physics/collisions.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -53,6 +56,7 @@ Called from the main loop every frame (main.c).
 /* the platform layer's (port/linux/src/port_config.c) */
 const char *config_string(char const *name);
 double config_real(char const *name);
+int config_boolean(char const *name);
 void platform_log(char const *format, ...);
 /* damage.c's */
 void damage_kill_object_for_player(long object_index, long player_index);
@@ -220,6 +224,17 @@ static void network_test_log_players(
 
 /* each of this machine's players hits the next player with their weapon's
 projectile, as its impact would */
+/* (debug builds) the red-team shooter of stage H1: hits through walls */
+static boolean network_test_cheat_wall_hits(
+	void)
+{
+#ifndef HALO_RELEASE
+	return config_boolean("debug.cheat_wall_hits") != 0;
+#else
+	return FALSE;
+#endif
+}
+
 static void network_test_shoot(
 	void)
 {
@@ -273,6 +288,22 @@ static void network_test_shoot(
 		if (damage_index == NONE)
 			continue;
 		target_object = object_get(target->unit_index);
+		/* an honest shooter needs a line through the level (the host's own
+		test: network_damage.c, distributed_path_clear) */
+		if (!network_test_cheat_wall_hits())
+		{
+			struct collision_result collision;
+
+			if (collision_test_line(
+				FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
+					FLAG(_collision_test_ignore_invisible_surfaces_bit) |
+					FLAG(_collision_test_ignore_breakable_surfaces_bit) |
+					FLAG(_collision_test_ignore_two_sided_surfaces_bit),
+				&unit->object.position, &target_object->object.position, NONE, &collision))
+			{
+				continue;
+			}
+		}
 		damage_data_new(&damage, damage_index);
 		damage.owner_player_index = iterator.datum_index;
 		damage.owner_object_index = player->unit_index;

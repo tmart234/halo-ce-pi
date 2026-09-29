@@ -153,6 +153,9 @@ enum
 	/* (host authority) the ticks of a client's own players' predicted
 	positions kept, a power of two (about two seconds) */
 	PREDICTION_HISTORY_TICKS = 64,
+	/* (host authority) position reports a machine may send before it has
+	the host's word that it decides (three seconds of them) */
+	IGNORED_PREDICTIONS_GRACE = 3 * 30,
 };
 
 /* how far players are from a client's own (world units) before the host
@@ -313,6 +316,8 @@ static struct
 	boolean valid;
 	struct distributed_unit_state state;
 } distributed_predictions[MAXIMUM_TRACKED_PLAYERS];
+/* the host, host authority: position reports each machine sent anyway */
+static long distributed_ignored_by_machine[HALO_PORT_MAXIMUM_NETWORK_MACHINES];
 /* a client: whether its host decides where every player is
 (_distributed_unit_host_authority_bit) */
 static boolean distributed_host_authority_seen;
@@ -920,6 +925,14 @@ static void distributed_handle_predictions(
 	if (network_distributed_host_authority())
 	{
 		distributed_statistics.ignored_predictions += count;
+		/* a client of this version stops sending them once it has the
+		host's word that it decides (a round trip): one that goes on is
+		modified, or of another build, and a Signal says so */
+		if (machine_index >= 0 && machine_index < HALO_PORT_MAXIMUM_NETWORK_MACHINES &&
+			(distributed_ignored_by_machine[machine_index] += count) > IGNORED_PREDICTIONS_GRACE && count > 0)
+		{
+			network_signal("position_report_ignored", "host_authority", machine_index, states[0].player_index);
+		}
 		return;
 	}
 	for (index = 0; index < count; index++)
@@ -1820,6 +1833,8 @@ void network_distributed_new_game(
 	}
 	distributed_host_time = NONE;
 	distributed_host_authority_seen = FALSE;
+	csmemset(distributed_ignored_by_machine, 0, sizeof(distributed_ignored_by_machine));
+	network_signals_new_game();
 	csmemset(distributed_prediction_history, 0, sizeof(distributed_prediction_history));
 	distributed_statistics_due = FALSE;
 	distributed_pickup_count = 0;
