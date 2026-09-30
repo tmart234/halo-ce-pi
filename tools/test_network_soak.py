@@ -65,7 +65,14 @@ def test_attacks(tmp_path):
 
     radar = status(900, 0, 0) + "cheat: radar sees 2 hidden (2 so far): player 0 (1 2 3) player 1 (4 5 6)\n"
     ms = machines(tmp_path / "c", status(900, 0, 0), [status(900, 0, 0), radar])
+    # (against a host sending everything: the attack works)
+    assert network_soak.judge("radar_open", ms).passed
+    # (against relevance: the host must have withheld someone)
+    assert not network_soak.judge("radar", ms).passed
+    filtered = radar + "cheat: radar withheld 3 (3 so far)\n"
+    ms = machines(tmp_path / "c2", status(900, 0, 0), [status(900, 0, 0), filtered])
     assert network_soak.judge("radar", ms).passed
+    assert not network_soak.judge("radar_open", ms).passed
 
     host = status(900, 4, 0) + "cheat: host immunity dropped a hit on its player 0 (1 so far)\n"
     ms = machines(tmp_path / "d", host, [status(900, 0, 0), status(900, 0, 0)])

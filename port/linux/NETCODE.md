@@ -181,9 +181,10 @@ not fix, for the stages that do:
 
 - `debug.cheat_radar`: a client that logs, every second, each player that
   no line through the level reaches from its own, with where the host says
-  they are (`cheat: radar sees ...`). The host sends every client every
-  unit, seen or not, so this works against every version so far. Relevance
-  filtering on the host (the mmo framework's stage H6) is the fix.
+  they are (`cheat: radar sees ...`), and how many the host withheld
+  (`cheat: radar withheld ...`). Against `network.relevance = "false"` the
+  host sends every client every unit, seen or not, and the radar finds
+  them all. Relevance filtering (below) is the fix.
 - `debug.cheat_host_immunity`: a host that drops the clients' hits on its
   own players after the checks pass and counts them as dealt
   (`cheat: host immunity dropped ...`). The clients see the host's player
@@ -213,9 +214,40 @@ python tools/network_soak.py --data ~/halo --scenario soak --minutes 30 --latenc
 | `soak` | Honest bots under latency and loss: the host dealt hits and wrote no Signal (no false rejects) |
 | `movement` | `debug.cheat_movement_step`: the host flags the client (`position_report_ignored`) |
 | `wall_hits` | `debug.cheat_wall_hits`: the host rejects its hits as `obstructed` |
-| `radar` | `debug.cheat_radar`: the radar saw hidden players (the attack works: H6 is open) |
+| `radar` | `debug.cheat_radar` against `network.relevance = "true"`: the host withheld players from the radar (and how many it still saw) |
+| `radar_open` | `debug.cheat_radar` against `network.relevance = "false"`: the radar saw hidden players and none was withheld (the attack works) |
 | `host_immunity` | `debug.cheat_host_immunity`: the host dropped hits on its player (the attack works: H4 is open) |
 | `forged_scale`, `forged_multiplier`, `forged_kill`, `forged_area` | `debug.cheat_damage`: the host rejects the forged reports for that reason, and no other hit |
+
+## Relevance: what a client is told
+
+A client that reads its own memory knows whatever the host tells it. With
+`network.relevance = "true"` (the host's; the default) the host tells each
+client only of the players its own players could perceive, the mmo
+framework's stage H6 (finding H06, the built-in wallhack):
+
+- in the set of the level's parts that the client's players' parts can see
+  (the same test that decides how often a player is sent);
+- within 32 world units of one of them: the motion tracker's reach (25) and
+  a margin, and where footsteps and gunfire are heard;
+- a teammate (team games), or the flag's or ball's carrier (on every HUD);
+- dead, or while the client's players are all dead (a spectator watches
+  anyone).
+
+A player stays sent 15 ticks (half a second) after it no longer counts, so
+that one skirting a corner does not flicker. Of one that no longer counts
+the client is sent one unit state with the hidden flag and no place; the
+client hides the unit and stops replaying its input, until a state with its
+place comes. Nothing else of it is sent: no states, no relayed input. The
+vehicle a player rides is sent a client only when one of its riders is.
+
+What a client still learns: where a withheld player was when the host
+stopped (the unit stays there, hidden); players within 32 units behind a
+wall (a wallhack there shows what the motion tracker nearly does); and the
+players in parts of the level the visibility test cannot rule out (it is
+coarse: a part sees another if any of it might). Damage effects, sounds
+and kill messages still name players as before. A line test per pair, as a
+finer filter, is future work.
 
 ## Joining a game in progress
 

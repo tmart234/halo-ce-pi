@@ -140,6 +140,12 @@ void distributed_count_correction(void);
 drive are, from their input (network.authority "host"): the host's own
 setting on the host; on a client, whether its host's unit states say so */
 boolean network_distributed_host_authority(void);
+/* (the host) whether it tells each client only of the players it could
+perceive (network.relevance), and whether it tells a client of a player */
+boolean network_distributed_relevance(void);
+boolean network_distributed_relevant(long machine_index, short player_index);
+/* (a client) whether the host no longer says where the player is */
+boolean network_distributed_withheld(short player_index);
 /* (a client, host authority) what its predictions are kept of */
 enum
 {

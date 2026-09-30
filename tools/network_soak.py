@@ -13,8 +13,13 @@ and the machines' logs say:
   flags it (position_report_ignored).
 - ``wall_hits``: one client runs debug.cheat_wall_hits. Passes when the host
   rejects its hits as obstructed.
-- ``radar``: one client runs debug.cheat_radar. Passes when it saw players
-  behind walls: the attack works, as it will until relevance filtering (H6).
+- ``radar``: one client runs debug.cheat_radar against a host filtering by
+  relevance (network.relevance, H6). Passes when the host withheld players
+  from it; says how many it still saw behind walls (near ones, and those the
+  level's coarse visibility could not rule out).
+- ``radar_open``: the same with network.relevance = false. Passes when the
+  radar saw players behind walls and none was withheld: the attack works
+  against a host that sends everyone everything, as the Xbox did.
 - ``host_immunity``: the host runs debug.cheat_host_immunity. Passes when it
   dropped hits on its own player: the attack works, as it will until
   evidence and the replay auditor (H4) prove it.
@@ -52,7 +57,7 @@ FORGERIES = {
     "forged_kill": ("kill", "forged_flags"),
     "forged_area": ("area", "forged_area"),
 }
-SCENARIOS = ("soak", "movement", "wall_hits", "radar", "host_immunity", *FORGERIES)
+SCENARIOS = ("soak", "movement", "wall_hits", "radar", "radar_open", "host_immunity", *FORGERIES)
 FIRST_ADDRESS = 200
 # the copies' own files in a data root, which each keeps apart
 OWN_FILES = {"debug.txt", "signals.jsonl", "config.toml"}
@@ -124,6 +129,7 @@ def plan(args: argparse.Namespace, scenario: str, work: Path) -> List[Machine]:
             env["HALO_NETWORK_TEST_KILL"] = str(args.kill)
             if scenario == "host_immunity":
                 env["HALO_CHEAT_HOST_IMMUNITY"] = "1"
+            env["HALO_NET_RELEVANCE"] = "false" if scenario == "radar_open" else "true"
         else:
             env["HALO_NETWORK_TEST"] = "join"
             # the last client is the cheat
@@ -132,7 +138,7 @@ def plan(args: argparse.Namespace, scenario: str, work: Path) -> List[Machine]:
                     env["HALO_CHEAT_MOVEMENT_STEP"] = str(args.movement_step)
                 elif scenario == "wall_hits":
                     env["HALO_CHEAT_WALL_HITS"] = "1"
-                elif scenario == "radar":
+                elif scenario in ("radar", "radar_open"):
                     env["HALO_CHEAT_RADAR"] = "1"
                 elif scenario in FORGERIES:
                     env["HALO_CHEAT_DAMAGE"] = FORGERIES[scenario][0]
@@ -197,10 +203,13 @@ def judge(scenario: str, machines: List[Machine]) -> Result:
     if scenario == "wall_hits":
         obstructed = kinds.get("hit_report_rejected:obstructed", 0)
         return Result(scenario, obstructed > 0, details + [f"{obstructed} hits rejected as obstructed"])
-    if scenario == "radar":
-        seen = re.findall(r"cheat: radar sees (\d+) hidden", clients[-1].log)
-        total = sum(int(count) for count in seen)
-        return Result(scenario, total > 0, details + [f"the radar saw {total} hidden players (H06 open until H6)"])
+    if scenario in ("radar", "radar_open"):
+        seen = sum(int(count) for count in re.findall(r"cheat: radar sees (\d+) hidden", clients[-1].log))
+        withheld = sum(int(count) for count in re.findall(r"cheat: radar withheld (\d+)", clients[-1].log))
+        details.append(f"the radar saw {seen} hidden players; the host withheld {withheld}")
+        if scenario == "radar_open":
+            return Result(scenario, seen > 0 and withheld == 0, details)
+        return Result(scenario, withheld > 0, details)
     if scenario in FORGERIES:
         reason = FORGERIES[scenario][1]
         rejected_forged = kinds.get(f"hit_report_rejected:{reason}", 0)

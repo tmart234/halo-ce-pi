@@ -99,6 +99,10 @@ void update_client_handle_relayed_action(
 	struct player_action const *action,
 	unsigned short const *control_flags,
 	short count);
+/* (a client) the player at that absolute index is hidden from this machine
+by the host (network.relevance): its last action is no longer held */
+void update_client_clear_relayed_action(
+	short player_index);
 /* (a client) a local player's last tick, its action and the buttons of the
 ticks up to it; FALSE before its first */
 boolean update_client_distributed_input(

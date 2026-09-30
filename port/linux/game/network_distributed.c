@@ -55,6 +55,8 @@ machine (their datum identifiers need not be).
 #include "game/game.h"
 #include "game/players.h"
 #include "game/player_queues_new.h"
+#include "game/game_engine.h"
+#include "game/game_globals.h"
 #include "networking/network_game_globals.h"
 #include "objects/objects.h"
 #include "objects/damage.h"
@@ -142,6 +144,9 @@ enum
 	/* (alive) camouflaged, and doubly so */
 	_distributed_unit_camouflaged_bit = 0,
 	_distributed_unit_super_camouflaged_bit,
+	/* (alive) the host no longer tells this machine where the player is
+	(network.relevance): no position, and no input until it says again */
+	_distributed_unit_hidden_bit,
 };
 
 /* world units: how far a client's own player's unit may be from the host's
@@ -185,7 +190,16 @@ scope (a sniper sees a far player as well as a near one, as Ares does).
 enum
 {
 	HIDDEN_PLAYER_PERIOD_TICKS = 6,
+	/* (network.relevance) a player a client could perceive stays sent this
+	many ticks after it no longer could, so that one skirting a corner does
+	not flicker */
+	RELEVANCE_LINGER_TICKS = 15,
 };
+
+/* (network.relevance) how near a client's player another is always sent: the
+motion tracker's reach (25 world units) and a margin, and where footsteps and
+gunfire are heard */
+#define RELEVANCE_RADIUS 32.0f
 
 /* shields, health and the damage they show in 16 bits: 0 to 4 */
 #define VITALITY_SCALE 16384.0f
@@ -352,6 +366,15 @@ static struct
 /* the host: whether each client's players could see each player last tick
 (one who comes into sight is sent at once) */
 static boolean distributed_seen[HALO_PORT_MAXIMUM_NETWORK_MACHINES][MAXIMUM_TRACKED_PLAYERS];
+/* (the host, network.relevance) whether it sends each client each player:
+the client's players could perceive them lately; until when that holds; and
+whether the client has been told the player is hidden */
+static boolean distributed_relevant[HALO_PORT_MAXIMUM_NETWORK_MACHINES][MAXIMUM_TRACKED_PLAYERS];
+static long distributed_relevant_until[HALO_PORT_MAXIMUM_NETWORK_MACHINES][MAXIMUM_TRACKED_PLAYERS];
+static boolean distributed_hidden_sent[HALO_PORT_MAXIMUM_NETWORK_MACHINES][MAXIMUM_TRACKED_PLAYERS];
+/* (a client, network.relevance) the players the host no longer says where
+they are */
+static boolean distributed_withheld[MAXIMUM_TRACKED_PLAYERS];
 /* the host: each player's statistics as last sent (only a change is sent,
 and a few players' each time whatever they are, round them all) */
 static unsigned long distributed_sent_statistics[MAXIMUM_TRACKED_PLAYERS];
@@ -422,6 +445,70 @@ boolean network_distributed_host_authority(
 	if (host_authority == NONE)
 		host_authority = csstrcmp(config_string("network.authority"), "client") != 0;
 	return host_authority;
+}
+
+/* (the host) whether it tells its clients only of the players they could
+perceive (network.relevance, the host's; "false" tells every client of
+every player, as the Xbox did): the fix of the built-in wallhack (the mmo
+repository's finding H06) */
+boolean network_distributed_relevance(
+	void)
+{
+	static short relevance = NONE;
+
+	if (relevance == NONE)
+		relevance = csstrcmp(config_string("network.relevance"), "false") != 0;
+	return relevance;
+}
+
+/* (the host) whether a client is told of the player (network_objects.c: the
+vehicles players ride) */
+boolean network_distributed_relevant(
+	long machine_index,
+	short player_index)
+{
+	if (machine_index < 0 || machine_index >= HALO_PORT_MAXIMUM_NETWORK_MACHINES || player_index < 0 ||
+		player_index >= MAXIMUM_TRACKED_PLAYERS)
+	{
+		return TRUE;
+	}
+	return !network_distributed_relevance() || distributed_relevant[machine_index][player_index] ||
+		distributed_machine_has_player(machine_index, player_index);
+}
+
+/* whether the player carries the game's flag or ball (their place is on
+every HUD, as a waypoint) */
+static boolean distributed_carries_objective(
+	long unit_index)
+{
+	struct game_globals *globals = scenario_get_game_globals();
+	struct unit_datum *unit;
+	short slot;
+
+	if (unit_index == NONE || !globals || globals->multiplayer_information.count < 1)
+		return FALSE;
+	unit = unit_get(unit_index);
+	for (slot = 0; slot < MAXIMUM_WEAPONS_PER_UNIT; slot++)
+	{
+		long weapon_index = unit->unit.weapon_object_indices[slot];
+		struct game_globals_multiplayer_information *information = TAG_BLOCK_GET_ELEMENT(
+			&globals->multiplayer_information, 0, struct game_globals_multiplayer_information);
+		long definition_index;
+
+		if (weapon_index == NONE || !object_try_and_get(weapon_index))
+			continue;
+		definition_index = object_get(weapon_index)->definition_index;
+		if (definition_index == information->flag.index || definition_index == information->ball.index)
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/* (a client) whether the host no longer says where the player is */
+boolean network_distributed_withheld(
+	short player_index)
+{
+	return player_index >= 0 && player_index < MAXIMUM_TRACKED_PLAYERS && distributed_withheld[player_index];
 }
 
 boolean distributed_player_input_tick(
@@ -1141,7 +1228,14 @@ static void distributed_handle_unit_states(
 			/* died on the host (who counts it; the damage that killed it,
 			network_damage.c, usually kills it here first) */
 			if (unit_index != NONE)
+			{
+				/* (a withheld player's body shows where it fell) */
+				if (state->player_index < MAXIMUM_TRACKED_PLAYERS && distributed_withheld[state->player_index])
+					object_set_visibility(unit_index, TRUE);
 				unit_kill_no_statistics(unit_index);
+			}
+			if (state->player_index < MAXIMUM_TRACKED_PLAYERS)
+				distributed_withheld[state->player_index] = FALSE;
 			continue;
 		}
 		/* spawned on the host: the host's unit is the player's here too, once
@@ -1156,12 +1250,34 @@ static void distributed_handle_unit_states(
 			if (player->unit_index != NONE)
 				network_player_detach_unit(player_index);
 			network_player_attach_unit(player_index, state->unit_index);
+			/* (a new unit: shown until the host says otherwise) */
+			if (state->player_index < MAXIMUM_TRACKED_PLAYERS)
+				distributed_withheld[state->player_index] = FALSE;
 			/* (a unit of a life this machine missed the end of, no player's
 			now: unit_kill_no_statistics is for players' units only) */
 			if (unit_index != NONE && unit_index != state->unit_index)
 				unit_kill(unit_index);
 		}
 		unit_index = state->unit_index;
+		/* (network.relevance) the host says no more where the player is: the
+		unit is hidden and not driven (its input is not relayed), until a
+		state with its place comes */
+		if (!local)
+		{
+			boolean hidden = TEST_FLAG(state->unit_flags, _distributed_unit_hidden_bit);
+
+			if (state->player_index < MAXIMUM_TRACKED_PLAYERS &&
+				hidden != distributed_withheld[state->player_index])
+			{
+				distributed_withheld[state->player_index] = hidden;
+				object_set_visibility(unit_index, !hidden);
+			}
+			if (hidden)
+			{
+				update_client_clear_relayed_action(state->player_index);
+				continue;
+			}
+		}
 		/* the seat it rides: a client's own player's, once it has ridden
 		otherwise for longer than its prediction takes to reach the host and
 		come back */
@@ -1384,6 +1500,9 @@ static void distributed_host_send_players(
 	static real_point3d origins[MAXIMUM_TRACKED_PLAYERS];
 	static short clusters[MAXIMUM_TRACKED_PLAYERS];
 	static boolean placed[MAXIMUM_TRACKED_PLAYERS];
+	static boolean carriers[MAXIMUM_TRACKED_PLAYERS];
+	boolean relevance = network_distributed_relevance();
+	boolean teams = game_engine_has_teams();
 	struct distributed_unit_state_message state_message;
 	struct
 	{
@@ -1416,6 +1535,7 @@ static void distributed_host_send_players(
 
 		present[player_index] = player != NULL;
 		placed[player_index] = FALSE;
+		carriers[player_index] = FALSE;
 		has_action[player_index] = FALSE;
 		if (!player)
 			continue;
@@ -1426,6 +1546,7 @@ static void distributed_host_send_players(
 			object_get_origin(unit_index, &origins[player_index]);
 			clusters[player_index] = distributed_object_cluster(unit_index);
 			placed[player_index] = TRUE;
+			carriers[player_index] = relevance && distributed_carries_objective(unit_index);
 		}
 		changed[player_index] =
 			distributed_sent_units[player_index].flags != state->flags ||
@@ -1451,6 +1572,7 @@ static void distributed_host_send_players(
 		short viewer_clusters[MAXIMUM_LOCAL_PLAYERS];
 		real_vector3d viewer_aims[MAXIMUM_LOCAL_PLAYERS];
 		boolean viewer_scoped[MAXIMUM_LOCAL_PLAYERS];
+		long viewer_teams[MAXIMUM_LOCAL_PLAYERS];
 		short viewer_count = 0;
 		short state_count = 0;
 		short action_count = 0;
@@ -1467,6 +1589,7 @@ static void distributed_host_send_players(
 
 				viewers[viewer_count] = origins[viewer_index];
 				viewer_clusters[viewer_count] = clusters[viewer_index];
+				viewer_teams[viewer_count] = distributed_player(viewer_index)->team_index;
 				viewer_aims[viewer_count] = viewer->unit.aiming_vector;
 				/* (NONE unzoomed: a char, which is unsigned on ARM) */
 				viewer_scoped[viewer_count++] = (signed char)viewer->unit.current_zoom_level >= 0;
@@ -1477,15 +1600,17 @@ static void distributed_host_send_players(
 			boolean own = present[player_index] && distributed_machine_has_player(machine_index, player_index);
 			boolean send = FALSE;
 			short period = 1;
+			real nearest = -1.0f;
+			boolean visible = TRUE;
 
 			if (!present[player_index])
 				continue;
 			/* (a client with no player in the world, dead, watches anyone) */
 			if (!own && placed[player_index] && viewer_count)
 			{
-				real nearest = -1.0f;
-				boolean visible = FALSE;
 				short aimed_period = HIDDEN_PLAYER_PERIOD_TICKS;
+
+				visible = FALSE;
 
 				for (index = 0; index < viewer_count; index++)
 				{
@@ -1530,6 +1655,62 @@ static void distributed_host_send_players(
 			else
 			{
 				distributed_seen[machine_index][player_index] = TRUE;
+			}
+			/* (network.relevance) a player the client's players could not
+			perceive is not sent at all: no place, no input (a memory-reading
+			client's radar finds nothing). Perceivable: in the set of what its
+			clusters can see, within the motion tracker's reach, a teammate,
+			the flag's or ball's carrier (on every HUD), or dead (no place to
+			give away); and a little while after, not to flicker. The client
+			is told once that the player is hidden; it hides the unit and
+			stops driving it */
+			if (!own && relevance)
+			{
+				boolean teammate = FALSE;
+				boolean relevant;
+
+				for (index = 0; teams && index < viewer_count; index++)
+					teammate |= viewer_teams[index] == distributed_player(player_index)->team_index;
+				relevant = !placed[player_index] || !viewer_count || teammate || carriers[player_index] || visible ||
+					(nearest >= 0.0f && nearest < RELEVANCE_RADIUS * RELEVANCE_RADIUS);
+				if (relevant)
+					distributed_relevant_until[machine_index][player_index] = game_time_get() + RELEVANCE_LINGER_TICKS;
+				else
+					relevant = game_time_get() < distributed_relevant_until[machine_index][player_index];
+				distributed_relevant[machine_index][player_index] = relevant;
+				if (!relevant)
+				{
+					if (!distributed_hidden_sent[machine_index][player_index])
+					{
+						struct distributed_unit_state *hidden = &state_message.states[state_count++];
+
+						*hidden = states[player_index];
+						SET_FLAG(hidden->unit_flags, _distributed_unit_hidden_bit, TRUE);
+						csmemset(&hidden->position, 0, sizeof(hidden->position));
+						csmemset(&hidden->velocity, 0, sizeof(hidden->velocity));
+						csmemset(&hidden->forward, 0, sizeof(hidden->forward));
+						csmemset(&hidden->up, 0, sizeof(hidden->up));
+						distributed_hidden_sent[machine_index][player_index] = TRUE;
+						if (state_count == state_limit)
+						{
+							distributed_send_to_machine(machine_index, &state_message, _distributed_message_unit_states,
+								state_count,
+								(word)(sizeof(state_message.header) + state_count * sizeof(struct distributed_unit_state)));
+							state_count = 0;
+						}
+					}
+					continue;
+				}
+				/* (perceivable again: at once) */
+				if (distributed_hidden_sent[machine_index][player_index])
+				{
+					send = TRUE;
+					distributed_hidden_sent[machine_index][player_index] = FALSE;
+				}
+			}
+			else
+			{
+				distributed_relevant[machine_index][player_index] = TRUE;
 			}
 			send |= changed[player_index] || (game_time_get() + player_index) % period == 0;
 			if (send || own)
@@ -1831,6 +2012,10 @@ void network_distributed_new_game(
 	csmemset(distributed_predictions, 0, sizeof(distributed_predictions));
 	csmemset(distributed_round_trips, 0, sizeof(distributed_round_trips));
 	csmemset(distributed_seen, 0, sizeof(distributed_seen));
+	csmemset(distributed_relevant, 0, sizeof(distributed_relevant));
+	csmemset(distributed_relevant_until, 0, sizeof(distributed_relevant_until));
+	csmemset(distributed_hidden_sent, 0, sizeof(distributed_hidden_sent));
+	csmemset(distributed_withheld, 0, sizeof(distributed_withheld));
 	/* (none sent: every player's the first time) */
 	csmemset(distributed_sent_statistics, 0, sizeof(distributed_sent_statistics));
 	distributed_statistics_cursor = 0;
