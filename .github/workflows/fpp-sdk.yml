@@ -1,0 +1,168 @@
+name: Update the fpp SDK
+
+# Keeps the fpp SDK (tools/fpp_sdk.py) at mmo's newest main without anyone
+# raising its pinned commit by hand:
+#
+# 1. `python3 tools/fpp_sdk.py bump` pins mmo's main if the SDK's source
+#    changed there (not for mmo's documentation), with that commit's fpp.h
+#    and the Android stand-in rewritten to match;
+# 2. the change goes to the bot/fpp-sdk branch, with a pull request as its
+#    record (the mmo commits it takes in);
+# 3. the Build workflow builds and tests every port with it (pushes made
+#    with this workflow's token start no workflow, so it is started by
+#    hand, as workflow_dispatch);
+# 4. when that passes the pull request is merged, and Build runs on main
+#    (its release); when it fails the pull request stays open, red, for a
+#    person: the SDK changed in a way the port has to follow.
+#
+# The pin stays in the repository, so every build says exactly which SDK it
+# has; only raising it is automated.
+#
+# It runs every six hours, by hand (Actions > Update the fpp SDK > Run
+# workflow, optionally with another mmo branch, tag or commit), and at once
+# when mmo's main changes if mmo has a HALO_DISPATCH_TOKEN secret (mmo's
+# .github/workflows/dependents.yml).
+#
+# The pull request needs Settings > Actions > General > "Allow GitHub
+# Actions to create and approve pull requests"; without it the change is
+# pushed to main directly once Build passes, and its commit message is the
+# record.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "mmo branch, tag or commit to pin"
+        default: main
+  repository_dispatch:
+    types: [mmo-main]
+
+concurrency:
+  group: fpp-sdk
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BRANCH: bot/fpp-sdk
+      REF: ${{ inputs.ref || 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Bump
+        id: bump
+        run: |
+          old="$(python3 tools/fpp_sdk.py commit)"
+          python3 tools/fpp_sdk.py bump "$REF" | tee bump.txt
+          new="$(python3 tools/fpp_sdk.py commit)"
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          fi
+
+      - name: Push
+        id: push
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          OLD: ${{ steps.bump.outputs.old }}
+          NEW: ${{ steps.bump.outputs.new }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          compare="https://github.com/tmart234/mmo/compare/$OLD...$NEW"
+          {
+            echo "Update the fpp SDK to mmo ${NEW:0:12}"
+            echo
+            echo "From ${OLD:0:12} ($REF): $compare"
+            echo
+            echo "Made by the Update the fpp SDK workflow (tools/fpp_sdk.py bump)."
+          } > message.txt
+          git commit -qa -F message.txt
+          # (a person's fix on the branch, for an update Build failed on, is
+          # not written over: they finish that one)
+          if git fetch -q origin "$BRANCH" 2>/dev/null &&
+              git log --format=%ae origin/main..FETCH_HEAD | grep -qv 'github-actions\[bot\]'; then
+            echo "::warning::$BRANCH has someone's commits: leaving it to them"
+            exit 0
+          fi
+          git push -f origin "HEAD:refs/heads/$BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "Pins the fpp SDK at mmo \`${NEW:0:12}\` (was \`${OLD:0:12}\`): [the changes]($compare)."
+            echo
+            echo '```'
+            cat bump.txt
+            echo '```'
+            echo
+            echo "The Update the fpp SDK workflow made this and merges it once Build passes on it. If Build fails, the SDK changed in a way the port must follow: push the fix to \`$BRANCH\` and re-run Build there, or close this (the next update starts over)."
+          } > body.md
+
+      - name: Pull request
+        id: pr
+        if: steps.push.outputs.sha != ''
+        env:
+          NEW: ${{ steps.bump.outputs.new }}
+        run: |
+          number="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "Update the fpp SDK to mmo ${NEW:0:12}" --body-file body.md
+          elif gh pr create --base main --head "$BRANCH" --title "Update the fpp SDK to mmo ${NEW:0:12}" \
+              --body-file body.md > pr.txt; then
+            number="$(gh pr view "$BRANCH" --json number --jq .number)"
+          else
+            echo "::warning::no pull request (allow Actions to create them in Settings > Actions): pushing to main once Build passes"
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test every port
+        if: steps.push.outputs.sha != ''
+        env:
+          SHA: ${{ steps.push.outputs.sha }}
+        run: |
+          gh workflow run build.yml --ref "$BRANCH"
+          run=""
+          for attempt in $(seq 30); do
+            sleep 10
+            run="$(gh run list --workflow build.yml --branch "$BRANCH" --event workflow_dispatch \
+              --json databaseId,headSha --jq "map(select(.headSha == \"$SHA\"))[0].databaseId // empty")"
+            [ -n "$run" ] && break
+          done
+          if [ -z "$run" ]; then
+            echo "::error::Build did not start on $BRANCH"
+            exit 1
+          fi
+          echo "Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
+          gh run watch "$run" --interval 30 --exit-status > /dev/null
+
+      - name: Merge
+        if: steps.push.outputs.sha != ''
+        env:
+          NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          if [ -n "$NUMBER" ]; then
+            gh pr merge "$NUMBER" --squash --delete-branch
+          else
+            # (fast-forward only: if main moved meanwhile, the next run
+            # starts over from it)
+            git push origin "HEAD:main"
+            git push origin --delete "$BRANCH"
+          fi
+          # (merged with this workflow's token, main's push starts no Build:
+          # its release)
+          gh workflow run build.yml --ref main

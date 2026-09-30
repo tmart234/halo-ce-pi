@@ -13,12 +13,23 @@ fetching the pinned commit (for work on both at once). Its header must
 match the vendored one.
 
     python tools/fpp_sdk.py linux     # builds, and prints the library's path
+    python tools/fpp_sdk.py commit    # prints the pinned commit
+    python tools/fpp_sdk.py bump      # pins mmo's main (or: bump <ref|commit>)
 
 The build files run it as a ninja step (ninja linux, ninja windows), so
 configuring needs no Rust, and a build of another port never runs it.
+
+The pin is not raised by hand: `bump` moves it to a newer commit when the
+SDK's source changed there (not for mmo's documentation), copies that
+commit's fpp.h over the vendored one and rewrites the Android stand-in
+(tools/fpp_sdk_stub.py). The "Update the fpp SDK" workflow
+(.github/workflows/fpp-sdk.yml) runs it on a schedule, when mmo's main
+changes, or by hand, builds and tests every port with the result, and
+merges it when they pass.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,11 +39,15 @@ from typing import List, Optional
 ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "https://github.com/tmart234/mmo.git"
 # the mmo commit whose crates/fpp-ffi this port uses (and whose fpp.h is
-# vendored); raise it with the header
+# vendored); raised by `bump` (below), not by hand
 COMMIT = "d520f3bd956ba254ff2c543187ed8d1c07621dc2"
 HEADER = ROOT / "port/third_party/fpp/include/fpp.h"
 INCLUDE = HEADER.parent
 THIRD_PARTY = ROOT / "build/third_party"
+
+# what the SDK is built from in mmo: a commit changing none of these (its
+# documentation, say) is not worth a new pin
+SDK_PATHS = ["crates", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rust-toolchain"]
 
 TARGETS = {
     "linux": ("i686-unknown-linux-gnu", "libfpp.a"),
@@ -61,8 +76,9 @@ def _run(command: List[str], cwd: Optional[Path] = None) -> None:
         raise SdkError(f"{' '.join(command)} failed ({result.returncode})")
 
 
-def source_checkout() -> Path:
-    """a checkout of mmo: HALO_FPP_SOURCE, or the pinned commit fetched"""
+def source_checkout(commit: str = COMMIT) -> Path:
+    """a checkout of mmo: HALO_FPP_SOURCE, or the commit (the pinned one)
+    fetched"""
     local = os.environ.get("HALO_FPP_SOURCE")
     if local:
         return Path(local).resolve()
@@ -70,7 +86,7 @@ def source_checkout() -> Path:
     head = checkout / ".git" / "HEAD"
     if head.is_file():
         current = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True).stdout
-        if current.strip() == COMMIT:
+        if current.strip() == commit:
             return checkout
     if shutil.which("git") is None:
         raise SdkError("git is needed to fetch the SDK's source")
@@ -78,9 +94,52 @@ def source_checkout() -> Path:
     if not head.is_file():
         _run(["git", "init", "-q"], checkout)
         _run(["git", "remote", "add", "origin", REPOSITORY], checkout)
-    _run(["git", "fetch", "-q", "--depth", "1", "origin", COMMIT], checkout)
-    _run(["git", "checkout", "-q", "--detach", COMMIT], checkout)
+    _run(["git", "fetch", "-q", "--depth", "1", "origin", commit], checkout)
+    _run(["git", "checkout", "-q", "--detach", commit], checkout)
     return checkout
+
+
+def resolve(ref: str) -> str:
+    """a branch or tag of mmo (or a full commit) as a commit"""
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        return ref
+    result = subprocess.run(["git", "ls-remote", REPOSITORY, f"refs/heads/{ref}", f"refs/tags/{ref}"],
+                            capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.split():
+        raise SdkError(f"no {ref} in {REPOSITORY}")
+    return result.stdout.split()[0]
+
+
+def bump(ref: str) -> bool:
+    """pins the SDK at mmo's ref (a branch, a tag or a commit) if the SDK's
+    source differs there from the pinned commit's: the pin, the vendored
+    header and the Android stand-in, as one change; whether it changed"""
+    import fpp_sdk_stub
+
+    if os.environ.get("HALO_FPP_SOURCE"):
+        raise SdkError("bump pins a commit of mmo itself: unset HALO_FPP_SOURCE")
+    commit = resolve(ref)
+    if commit == COMMIT:
+        print(f"the SDK is pinned at {ref} ({commit}) already")
+        return False
+    checkout = source_checkout(commit)
+    # (the pinned commit too, to tell whether the SDK changed in between)
+    _run(["git", "fetch", "-q", "--depth", "1", "origin", COMMIT], checkout)
+    changed = subprocess.run(["git", "diff", "--quiet", COMMIT, commit, "--", *SDK_PATHS], cwd=checkout)
+    if changed.returncode == 0:
+        print(f"{ref} ({commit[:12]}) changes nothing the SDK is built from since {COMMIT[:12]}: pin kept")
+        return False
+    header = checkout / "crates/fpp-ffi/include/fpp.h"
+    header_changed = header.read_bytes().replace(b"\r\n", b"\n") != HEADER.read_bytes().replace(b"\r\n", b"\n")
+    shutil.copyfile(header, HEADER)
+    script = Path(__file__)
+    text = script.read_text()
+    script.write_text(re.sub(r'^COMMIT = "[0-9a-f]{40}"$', f'COMMIT = "{commit}"', text, count=1, flags=re.M))
+    fpp_sdk_stub.STUB.write_text(fpp_sdk_stub.render())
+    print(f"pinned the SDK at {ref} ({commit}), was {COMMIT}"
+          f"{'; fpp.h changed' if header_changed else ''}")
+    print(f"changes: {REPOSITORY.removesuffix('.git')}/compare/{COMMIT}...{commit}")
+    return True
 
 
 def library_path(platform: str) -> Path:
@@ -125,11 +184,22 @@ def build(platform: str) -> Path:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in TARGETS:
+    arguments = sys.argv[1:]
+    if arguments == ["commit"]:
+        print(COMMIT)
+        return 0
+    if arguments[:1] == ["bump"] and len(arguments) <= 2:
+        try:
+            bump(arguments[1] if len(arguments) == 2 else "main")
+        except SdkError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        return 0
+    if len(arguments) != 1 or arguments[0] not in TARGETS:
         print(__doc__)
         return 2
     try:
-        print(build(sys.argv[1]))
+        print(build(arguments[0]))
     except SdkError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
