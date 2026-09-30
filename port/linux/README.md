@@ -428,6 +428,15 @@ or `rustup target add i686-pc-windows-msvc` (Windows). The Android build
 has no SDK, so internet play is off on Android. An invite from a version
 before the secure sessions does not operate.
 
+The pinned commit (`COMMIT` in `tools/fpp_sdk.py`) is not raised by hand.
+The "Update the fpp SDK" workflow (`.github/workflows/fpp-sdk.yml`) runs
+`python tools/fpp_sdk.py bump` every six hours, by hand, or when mmo
+signals a change. It pins mmo's newest main only if the SDK's source
+changed, copies its `fpp.h` and rewrites the Android stand-in. Then it
+builds and tests every port on the `bot/fpp-sdk` branch and merges the
+update when they pass. Run `python tools/fpp_sdk.py bump` locally to do the
+same by hand.
+
 To test internet play on one computer (no game data is necessary), enter
 `python tools/p2p_loopback_test.py`. The test uses a local MQTT broker
 (`tools/mqtt_test_broker.py`).
