@@ -54,6 +54,11 @@ boolean distributed_get_death(short dead_player_index, byte *killing_player_inde
 	boolean *killed_by_vehicle);
 /* cache_files.c's */
 boolean tag_index_is_group(long tag_index, long group_tag);
+/* port_config.c's */
+#ifndef HALO_RELEASE
+int config_boolean(char const *name);
+void platform_log(char const *format, ...);
+#endif
 
 enum
 {
@@ -900,6 +905,38 @@ static char const *distributed_report_rejection(
 	return NULL;
 }
 
+/* (debug builds) the red-team host of stage H1 (finding H09): it drops a
+client's hit on one of its own players after the checks pass, and counts it
+as dealt, as a cheating host would. Nothing a client can check at the time
+shows it: the clients see the host's player unhurt. Only evidence of what
+the host was sent and what it decided (stage H4) proves it */
+static boolean distributed_cheat_host_immunity(
+	long object_index)
+{
+#ifndef HALO_RELEASE
+	static long dropped;
+	struct data_iterator iterator;
+	struct player_datum *player;
+
+	if (!config_boolean("debug.cheat_host_immunity"))
+		return FALSE;
+	data_iterator_new(&iterator, player_data);
+	while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL)
+	{
+		if (player->local_player_index != NONE && player->unit_index != NONE && player->unit_index == object_index)
+		{
+			dropped++;
+			platform_log("cheat: host immunity dropped a hit on its player %ld (%ld so far)",
+				(long)DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index), dropped);
+			return TRUE;
+		}
+	}
+#else
+	(void)object_index;
+#endif
+	return FALSE;
+}
+
 void network_damage_handle_reports(
 	long machine_index,
 	void const *entries,
@@ -925,6 +962,8 @@ void network_damage_handle_reports(
 			continue;
 		}
 		damage_dealt_reports++;
+		if (distributed_cheat_host_immunity(report->object_index))
+			continue;
 		damage_dealing_report = TRUE;
 		object_cause_damage(&damage, report->object_index, report->node_index, report->region_index,
 			report->material_index, report->has_normal ? &report->object_normal : NULL);

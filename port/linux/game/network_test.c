@@ -235,6 +235,72 @@ static boolean network_test_cheat_wall_hits(
 #endif
 }
 
+/* (debug builds) the red-team radar of stage H1 (finding H06): the host
+sends every client every player's unit, seen or not, so a client that reads
+them knows where players behind walls are. Every second, this logs each
+other living player that no line through the level reaches from this
+machine's player, with where the host says it is. Relevance filtering on
+the host (stage H6) is what makes this come up empty */
+static void network_test_cheat_radar(
+	void)
+{
+#ifndef HALO_RELEASE
+	static long hidden_seen;
+	struct data_iterator iterator;
+	struct player_datum *player;
+	struct player_datum *own = NULL;
+	struct object_datum *own_object;
+	char line[2048];
+	int length = 0;
+	int hidden = 0;
+
+	if (!config_boolean("debug.cheat_radar"))
+		return;
+	data_iterator_new(&iterator, player_data);
+	while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL)
+	{
+		if (player->local_player_index != NONE && player->unit_index != NONE)
+		{
+			own = player;
+			break;
+		}
+	}
+	if (!own)
+		return;
+	own_object = object_get(own->unit_index);
+	data_iterator_new(&iterator, player_data);
+	while ((player = (struct player_datum *)data_iterator_next(&iterator)) != NULL && length < (int)sizeof(line) - 96)
+	{
+		struct object_datum *object;
+		struct collision_result collision;
+
+		if (player == own || player->unit_index == NONE)
+			continue;
+		object = object_get(player->unit_index);
+		if (TEST_FLAG(object->object.damage_flags, _object_dead_bit))
+			continue;
+		/* (the host's own line test for hits: network_damage.c,
+		distributed_path_clear) */
+		if (!collision_test_line(
+			FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
+				FLAG(_collision_test_ignore_invisible_surfaces_bit) |
+				FLAG(_collision_test_ignore_breakable_surfaces_bit) |
+				FLAG(_collision_test_ignore_two_sided_surfaces_bit),
+			&own_object->object.position, &object->object.position, NONE, &collision))
+		{
+			continue;
+		}
+		hidden++;
+		length += snprintf(line + length, sizeof(line) - (size_t)length, " player %ld (%.3f %.3f %.3f)",
+			(long)DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index), object->object.position.x,
+			object->object.position.y, object->object.position.z);
+	}
+	hidden_seen += hidden;
+	if (hidden)
+		platform_log("cheat: radar sees %d hidden (%ld so far):%s", hidden, hidden_seen, line);
+#endif
+}
+
 static void network_test_shoot(
 	void)
 {
@@ -487,6 +553,8 @@ void network_test_update(
 	{
 		network_test.logged_time = game_time_get();
 		network_test_log_players();
+		if (network_test.mode == _network_test_join)
+			network_test_cheat_radar();
 		if (network_test.shoot_interval > 0.0f &&
 			game_time_get() % (long)(network_test.shoot_interval * TICKS_PER_SECOND) < TICKS_PER_SECOND)
 		{
