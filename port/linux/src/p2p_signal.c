@@ -8,13 +8,15 @@ once, so any one of them working is enough.
 
 Everything that passes through them is sealed with a key derived from the
 invite's token, and goes to topics that are hashes of it, so the brokers
-(and anyone watching them) learn nothing and can join nothing:
+(and anyone watching them) learn nothing and can join nothing. Every
+invite holder can read and forge these messages: they carry addresses and
+nothing more, and the tunnel's secure session (p2p.c) authenticates the
+host by the key in the invite, whatever signalling said:
 
 - the host listens on hceu/1/<HMAC(token, "host" | host)>, where a joiner
   sends JOIN: its identifier, a nonce, and its addresses;
 - the joiner listens on hceu/1/<HMAC(token, "joiner" | joiner)>, where the
-  host answers ACCEPT: the nonce, a new random key for their tunnel, and
-  its own addresses.
+  host answers ACCEPT: the nonce and its own addresses.
 
 A joiner repeats its JOIN until the tunnel reaches the host.
 */
@@ -61,7 +63,8 @@ enum
 {
 	_message_join = 'J',
 	_message_accept = 'A',
-	MESSAGE_VERSION = 1,
+	/* 2: the accept carries no tunnel key (the fpp session makes its own) */
+	MESSAGE_VERSION = 2,
 };
 
 struct broker
@@ -90,7 +93,6 @@ struct joiner
 {
 	unsigned char identifier[P2P_IDENTIFIER_SIZE];
 	unsigned char nonce[NONCE_SIZE];
-	unsigned char key[P2P_SHA256_SIZE];
 	unsigned long answered_time;
 	int used;
 };
@@ -451,10 +453,9 @@ static void join_received(const unsigned char *message, int size)
 			joiner->used = 1;
 		}
 		memcpy(joiner->nonce, nonce, NONCE_SIZE);
-		posix_random_bytes(joiner->key, sizeof(joiner->key));
 	}
 	joiner->answered_time = p2p_now();
-	p2p_peer_offered(identifier, joiner->key, candidates, count, 0);
+	p2p_peer_offered(identifier, candidates, count, 0);
 
 	answer[answer_size++] = _message_accept;
 	answer[answer_size++] = MESSAGE_VERSION;
@@ -464,8 +465,6 @@ static void join_received(const unsigned char *message, int size)
 	answer_size += P2P_IDENTIFIER_SIZE;
 	memcpy(answer + answer_size, nonce, NONCE_SIZE);
 	answer_size += NONCE_SIZE;
-	memcpy(answer + answer_size, joiner->key, P2P_SHA256_SIZE);
-	answer_size += P2P_SHA256_SIZE;
 	answer_size += put_candidates(answer + answer_size);
 	answer_size = p2p_seal(signalling.host_key, answer, answer_size, sealed);
 	make_topic(signalling.host_token, "joiner", identifier, topic);
@@ -479,8 +478,7 @@ static void accept_received(const unsigned char *message, int size)
 	const unsigned char *host = message + 2;
 	const unsigned char *joiner = host + P2P_IDENTIFIER_SIZE;
 	const unsigned char *nonce = joiner + P2P_IDENTIFIER_SIZE;
-	const unsigned char *key = nonce + NONCE_SIZE;
-	int fixed = 2 + 2 * P2P_IDENTIFIER_SIZE + NONCE_SIZE + P2P_SHA256_SIZE;
+	int fixed = 2 + 2 * P2P_IDENTIFIER_SIZE + NONCE_SIZE;
 	int count;
 
 	if (size < fixed + 1 || memcmp(host, signalling.join_host, P2P_IDENTIFIER_SIZE) ||
@@ -488,7 +486,7 @@ static void accept_received(const unsigned char *message, int size)
 		return;
 	count = get_candidates(message + fixed, size - fixed, candidates);
 	if (count >= 0)
-		p2p_peer_offered(host, key, candidates, count, 1);
+		p2p_peer_offered(host, candidates, count, 1);
 }
 
 static void publish_received(const char *topic, const unsigned char *payload, int size)

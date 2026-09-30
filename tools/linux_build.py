@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from . import fpp_sdk
 from .ninja_syntax import Writer
 
 PORT_DIR = Path("port/linux")
@@ -342,6 +343,14 @@ def generate_linux_build(n: Writer, sln: Any) -> None:
     sdk_flags = f"-idirafter {XDK_INCLUDE}"
     excluded = set(config.get("exclude_sources", []))
     libs = " ".join(f"-l{lib}" for lib in config.get("libraries", []))
+    # internet play's secure sessions (the fpp SDK, tools/fpp_sdk.py): built
+    # from its pinned source, and linked by path (with -lfpp the linker
+    # would take a libfpp.so it found first)
+    try:
+        fpp_library = fpp_sdk.build("linux")
+    except fpp_sdk.SdkError as error:
+        raise SystemExit(f"error: {error}")
+    libs = " ".join([_quote(fpp_library), libs, *(f"-l{lib}" for lib in fpp_sdk.LINUX_LIBRARIES)])
 
     def emit(obj_dir: Path, output: Path, extra_cflags: List[str], extra_ldflags: List[str],
              implicit_inputs: List[Path]) -> None:
@@ -409,6 +418,8 @@ def generate_linux_build(n: Writer, sln: Any) -> None:
             f"-I{port_include}",
             f"-I{TOML_DIR}",
             f"-I{KCP_DIR}",
+            f"-I{fpp_sdk.INCLUDE}",
+            "-DHALO_FPP",
             "-Isource -Isource/cseries",
             sdk_flags,
         ])
@@ -457,7 +468,7 @@ def generate_linux_build(n: Writer, sln: Any) -> None:
                 "ldflags": " ".join(["--target=i686-linux-gnu", "-m32", "-no-pie", "-g", *extra_ldflags]),
                 "libs": libs,
             },
-            implicit=[Path("tools/linux_link_check.py")],
+            implicit=[Path("tools/linux_link_check.py"), fpp_library],
         )
 
     # Profile-guided optimisation: with the committed profile, or with

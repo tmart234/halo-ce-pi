@@ -52,7 +52,10 @@ jobs:
         run: |
           printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
           pacman -Syu --noconfirm --needed git zstd python python-pytest ninja ccache \
-            clang lld gcc lib32-glibc lib32-gcc-libs lib32-sdl3
+            clang lld gcc lib32-glibc lib32-gcc-libs lib32-sdl3 rustup
+          # internet play's secure sessions: the fpp SDK (tools/fpp_sdk.py)
+          rustup default stable
+          rustup target add i686-unknown-linux-gnu
 
       - uses: actions/checkout@v4
 
@@ -62,6 +65,14 @@ jobs:
           key: ccache-linux-${{ github.sha }}
           restore-keys: ccache-linux-
 
+      # the fpp SDK, built once per pinned commit (tools/fpp_sdk.py)
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/third_party/fpp/i686-unknown-linux-gnu
+            ~/.cargo/registry
+          key: fpp-linux-${{ hashFiles('tools/fpp_sdk.py') }}
+
       - name: Debug
         run: python tools/ci_build.py linux debug
 
@@ -69,7 +80,12 @@ jobs:
         run: python tools/ci_build.py linux release
 
       - name: Test
-        run: python -m pytest -q tools/test_linux_port.py
+        run: python -m pytest -q tools/test_linux_port.py tools/test_network_soak.py
+
+      # internet play's secure sessions, end to end on one computer: a host,
+      # a joiner, and one with a forged host key (no game data needed)
+      - name: Internet play
+        run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo
 
       - name: Compile cache
         run: ccache --show-stats
@@ -195,6 +211,18 @@ jobs:
         with:
           path: build/windows/third_party
           key: windows-third-party-${{ hashFiles('tools/windows_build.py') }}
+
+      # internet play's secure sessions: the fpp SDK (tools/fpp_sdk.py),
+      # with the runner's Rust
+      - name: Rust
+        run: rustup target add i686-pc-windows-msvc
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/third_party/fpp/i686-pc-windows-msvc
+            ~/.cargo/registry
+          key: fpp-windows-${{ hashFiles('tools/fpp_sdk.py') }}
 
       - name: Debug
         run: python tools/ci_build.py windows debug

@@ -16,11 +16,14 @@ enum
 	P2P_IDENTIFIER_SIZE = 6,
 	/* an invite's secret */
 	P2P_TOKEN_SIZE = 16,
+	/* a host's static X25519 public key, which its invites carry */
+	P2P_PUBLIC_KEY_SIZE = 32,
 	/* the addresses a machine offers to be reached at */
 	P2P_MAXIMUM_CANDIDATES = 4,
-	/* an invite link's text: "halo://join/", the host's identifier and the
-	token in hexadecimal, and a terminator */
-	P2P_LINK_SIZE = 64,
+	/* an invite link's text: "halo://join/", the host's identifier, the
+	token and the host's key in hexadecimal (108 digits, within the 128 of
+	a Discord secret), and a terminator */
+	P2P_LINK_SIZE = 128,
 	/* the most machines one tunnels to: a host and the rest of a system
 	link game's 128 machines (include/halo_port_limits.h) */
 	P2P_MAXIMUM_PEERS = 127,
@@ -49,10 +52,11 @@ void p2p_hex(const unsigned char *bytes, int size, char *text);
 /* the addresses this machine can be reached at; returns their count */
 int p2p_local_candidates(struct p2p_candidate *candidates, int maximum_count);
 /* a joiner (on the host) or the host (on a joiner) offered its addresses
-through signalling, and the key their tunnel traffic is sealed with
-(P2P_SHA256_SIZE bytes); the tunnel starts reaching it */
-void p2p_peer_offered(const unsigned char *identifier, const unsigned char *key,
-	const struct p2p_candidate *candidates, int count, int is_host);
+through signalling; the tunnel starts reaching it. Nothing in signalling
+is trusted: a host's key comes from the invite, and a session proves who is
+at the other end */
+void p2p_peer_offered(const unsigned char *identifier, const struct p2p_candidate *candidates, int count,
+	int is_host);
 /* an invite that arrived on the p2p thread (from Discord, or another copy
 of the game) */
 void p2p_invite_received(const char *text);

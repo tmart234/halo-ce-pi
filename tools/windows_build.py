@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from .linux_build import (LINUX_PROFILE, MINIUPNPC_DIR, OPTIMISATION, WINDOWS_PROFILE, XDK_INCLUDE, lto_mode,
                           march_flag, miniupnpc_sources, pgo_mode, compile_launcher, musl_math_cflags,
                           musl_math_sources, pgo_profile, profile_use_flags, xdk_headers)
+from . import fpp_sdk
 from .ninja_syntax import Writer
 
 LINUX_DIR = Path("port/linux")
@@ -242,6 +243,12 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     except OSError as error:
         print(f"Windows build disabled: cannot fetch SDL3 ({error})", file=sys.stderr)
         return
+    # internet play's secure sessions (the fpp SDK, tools/fpp_sdk.py), built
+    # from its pinned source
+    try:
+        fpp_library = fpp_sdk.build("windows")
+    except fpp_sdk.SdkError as error:
+        raise SystemExit(f"error: {error}")
     linux_config: Dict[str, Any] = json.loads((LINUX_DIR / "port.json").read_text(encoding="utf-8"))
     config = _load_config()
 
@@ -291,8 +298,9 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     sdl_include = SDL_DIR / "include"
     excluded = set(linux_config.get("exclude_sources", []))
     libs = " ".join(
-        [_quote(SDL_DIR / "lib" / "x86" / "SDL3.lib")]
+        [_quote(SDL_DIR / "lib" / "x86" / "SDL3.lib"), _quote(fpp_library)]
         + [f"-l{lib}" for lib in config.get("libraries", [])]
+        + [f"-l{lib}" for lib in fpp_sdk.WINDOWS_LIBRARIES]
     )
     base_ldflags = [
         "--target=i686-pc-windows-msvc",
@@ -367,6 +375,8 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
             f"-I{PORT_DIR / 'include'}",
             f"-I{TOML_DIR}",
             f"-I{KCP_DIR}",
+            f"-I{fpp_sdk.INCLUDE}",
+            "-DHALO_FPP",
             # halo_linux_winsock_names.h, but not the Linux build's C runtime
             # wrappers next to it
             f"-iquote {LINUX_DIR / 'include'}",
@@ -414,6 +424,7 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
             outputs=output,
             rule="windows_link",
             inputs=objects + extra_objects,
+            implicit=[fpp_library],
             variables={"ldflags": " ".join(base_ldflags + extra_ldflags), "libs": libs},
         )
 

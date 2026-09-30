@@ -153,6 +153,38 @@ Without the cheat, a soak of scripted bots (with `debug.network_latency`
 and `debug.network_loss`) should show no rejected hits. Any rejected hit
 there is a false reject to fix.
 
+Two more red-team switches (debug builds) show what host authority does
+not fix, for the stages that do:
+
+- `debug.cheat_radar`: a client that logs, every second, each player that
+  no line through the level reaches from its own, with where the host says
+  they are (`cheat: radar sees ...`). The host sends every client every
+  unit, seen or not, so this works against every version so far. Relevance
+  filtering on the host (the mmo framework's stage H6) is the fix.
+- `debug.cheat_host_immunity`: a host that drops the clients' hits on its
+  own players after the checks pass and counts them as dealt
+  (`cheat: host immunity dropped ...`). The clients see the host's player
+  unhurt, and nothing they can check at the time shows why. Only evidence
+  of what the host was sent and what it decided (stage H4: signed inputs,
+  host checkpoints and a replay auditor) proves it.
+
+`tools/network_soak.py` runs all of this on one computer, each copy with
+a data folder of its own (links to the game data) for its `debug.txt` and
+`signals.jsonl`, and says what passed:
+
+```bash
+python tools/network_soak.py --data ~/halo            # everything
+python tools/network_soak.py --data ~/halo --scenario soak --minutes 30 --latency 80 --loss 3
+```
+
+| Scenario | Passes when |
+| --- | --- |
+| `soak` | Honest bots under latency and loss: the host dealt hits and wrote no Signal (no false rejects) |
+| `movement` | `debug.cheat_movement_step`: the host flags the client (`position_report_ignored`) |
+| `wall_hits` | `debug.cheat_wall_hits`: the host rejects its hits as `obstructed` |
+| `radar` | `debug.cheat_radar`: the radar saw hidden players (the attack works: H6 is open) |
+| `host_immunity` | `debug.cheat_host_immunity`: the host dropped hits on its player (the attack works: H4 is open) |
+
 ## Joining a game in progress
 
 A distributed game stays open when it starts (a lockstep one closes, as on
