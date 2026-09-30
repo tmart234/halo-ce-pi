@@ -192,6 +192,14 @@ not fix, for the stages that do:
   of what the host was sent and what it decided (stage H4: signed inputs,
   host checkpoints and a replay auditor) proves it.
 
+Against the cheating host, internet play's evidence (stage H4,
+`port/linux/src/p2p_evidence.c`) records what each player sent the host
+reliably (its hit reports, signed each epoch) and what the host decided on
+each (an outcome in its signed Checkpoint). `debug.cheat_host_immunity`
+leaves its outcomes out, which the auditor (`fpp-audit`, in the mmo
+repository) finds in the player's evidence. Evidence is kept only for
+internet play games (the secure sessions carry it), not the LAN.
+
 `tools/network_soak.py` runs all of this on one computer, each copy with
 a data folder of its own (links to the game data) for its `debug.txt` and
 `signals.jsonl`, and says what passed:

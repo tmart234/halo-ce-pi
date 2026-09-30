@@ -54,6 +54,8 @@ boolean distributed_get_death(short dead_player_index, byte *killing_player_inde
 	boolean *killed_by_vehicle);
 /* cache_files.c's */
 boolean tag_index_is_group(long tag_index, long group_tag);
+/* internet play's evidence (port/linux/src/p2p_evidence.c, stage H4) */
+void p2p_evidence_host_outcome(unsigned long address, long tick, int unit, int applied, int reason);
 /* port_config.c's */
 #ifndef HALO_RELEASE
 int config_boolean(char const *name);
@@ -1067,6 +1069,57 @@ static boolean distributed_cheat_host_immunity(
 	return FALSE;
 }
 
+/* where the reports being handled came from, for the evidence of every
+report's outcome (p2p_evidence.c): the machine's address, the tick it sent
+them in, and the first report's place in that tick's frame */
+static struct
+{
+	unsigned long address;
+	long tick;
+	int unit_offset;
+} damage_report_origin = { 0, NONE, 0 };
+
+void network_damage_report_origin(
+	unsigned long address,
+	long tick,
+	int unit_offset)
+{
+	damage_report_origin.address = address;
+	damage_report_origin.tick = tick;
+	damage_report_origin.unit_offset = unit_offset;
+}
+
+/* a rejection's code in the evidence (0 is dealt); tools/network_soak.py
+and the auditor read them */
+static int distributed_rejection_code(
+	char const *rejection)
+{
+	static char const *const codes[] = {
+		"not_its_player", "bad_target", "weapon_not_carried", "forged_flags", "forged_area", "forged_scale",
+		"target_not_there", "impact_off_target", "obstructed", "melee_out_of_reach", "rate", "bad_damage",
+	};
+	short index;
+
+	for (index = 0; index < (short)NUMBEROF(codes); index++)
+	{
+		if (!strcmp(codes[index], rejection))
+			return index + 1;
+	}
+	return 255;
+}
+
+static void distributed_report_outcome(
+	short index,
+	char const *rejection)
+{
+	if (damage_report_origin.address && damage_report_origin.tick != NONE)
+	{
+		p2p_evidence_host_outcome(damage_report_origin.address, damage_report_origin.tick,
+			damage_report_origin.unit_offset + index, rejection == NULL,
+			rejection ? distributed_rejection_code(rejection) : 0);
+	}
+}
+
 void network_damage_handle_reports(
 	long machine_index,
 	void const *entries,
@@ -1089,11 +1142,15 @@ void network_damage_handle_reports(
 			damage_rejected_reports++;
 			network_signal("hit_report_rejected", rejection, machine_index,
 				report->damage.owner_player_index != NO_PLAYER ? report->damage.owner_player_index : NONE);
+			distributed_report_outcome(index, rejection);
 			continue;
 		}
 		damage_dealt_reports++;
+		/* (the cheating host of stage H1 leaves the outcome out, which the
+		player's evidence shows: the auditor finds the report unaccounted) */
 		if (distributed_cheat_host_immunity(report->object_index))
 			continue;
+		distributed_report_outcome(index, NULL);
 		damage_dealing_report = TRUE;
 		object_cause_damage(&damage, report->object_index, report->node_index, report->region_index,
 			report->material_index, report->has_normal ? &report->object_normal : NULL);

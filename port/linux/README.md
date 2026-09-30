@@ -185,6 +185,7 @@ the setting for one start of the game. It has priority over the file.
 | `debug.network_test`, `debug.network_test_start`, `debug.network_test_kill`, `debug.network_test_shoot`, `debug.network_test_vehicle`, `debug.network_test_pickup`, `debug.test_input` | off | `HALO_NETWORK_TEST`, `HALO_NETWORK_TEST_START`, `HALO_NETWORK_TEST_KILL`, `HALO_NETWORK_TEST_SHOOT`, `HALO_NETWORK_TEST_VEHICLE`, `HALO_NETWORK_TEST_PICKUP`, `HALO_TEST_INPUT` | Automatic tests of system link (`game/network_test.c`). Refer to `NETCODE.md`. |
 | `debug.cheat_movement_step` | `0.0` | `HALO_CHEAT_MOVEMENT_STEP` | Debug builds only. A red-team client for tests: each report of where its own player is goes this number of world units ahead of the player. `0`: off. Refer to "Host authority" in `NETCODE.md`. |
 | `debug.cheat_wall_hits` | `false` | `HALO_CHEAT_WALL_HITS` | Debug builds only. A red-team client for tests: `debug.network_test_shoot` hits through walls, and the host rejects those hits. Refer to "Host authority" in `NETCODE.md`. |
+| `debug.evidence_synthetic` | `""` | `HALO_EVIDENCE_SYNTHETIC` | For tests: the evidence of internet play without a game. A player sends a made-up hit report each second. `omit`: the host leaves out every other outcome. Refer to "Evidence of the host". |
 | `debug.cheat_damage` | `""` | `HALO_CHEAT_DAMAGE` | Debug builds only. A red-team client for tests: its hit reports forge the damage (`scale`, `multiplier`, `kill`, `area`), and the host rejects them. Refer to "Host authority" in `NETCODE.md`. |
 | `debug.cheat_radar` | `false` | `HALO_CHEAT_RADAR` | Debug builds only. A red-team client for tests: logs where the players it cannot see are, from what the host sends, and how many the host withheld. Refer to "Host authority" in `NETCODE.md`. |
 | `debug.cheat_host_immunity` | `false` | `HALO_CHEAT_HOST_IMMUNITY` | Debug builds only. A red-team host for tests: drops the hits of clients on its own players. Refer to "Host authority" in `NETCODE.md`. |
@@ -396,6 +397,29 @@ one computer. The test uses a development Verifier from the SDK.
 At this time, no build of the game can get a tier 2 result. Windows needs
 TPM attestation, and Android and iOS need the SDK in their builds, with the
 session key in the phone's hardware. These are the next steps.
+
+### Evidence of the host
+
+The host of an internet play game decides every hit. A player can later
+prove what the host did with its hits:
+
+- Each 5 seconds, the player signs its hit reports with its session key.
+- The host signs a Checkpoint each 5 seconds. The Checkpoint acknowledges
+  the player's signature, and gives an outcome for each hit report: applied,
+  or rejected with a reason. The host sends the Checkpoint to each player.
+- Each machine writes this evidence to `evidence/` in the data root, one
+  file for each game.
+- `fpp-audit` (the `mmo` repository, `crates/fpp-audit`) checks a file.
+  If the host did not acknowledge a signature, or gave no outcome for a hit
+  report, the auditor finds it.
+
+The auditor cannot find a host that records a false outcome (a hit that
+the host records as applied but does not apply). That needs a replay of the
+game, which is not done yet.
+
+Enter `python tools/p2p_loopback_test.py --evidence` to test this on one
+computer without game data. The test uses made-up hit reports
+(`debug.evidence_synthetic`).
 
 The SDK is Rust. `tools/fpp_sdk.py` builds it from a pinned commit of the
 `mmo` repository for the Linux and Windows builds. Install Rust (rustup)

@@ -61,6 +61,35 @@ void p2p_peer_offered(const unsigned char *identifier, const struct p2p_candidat
 of the game) */
 void p2p_invite_received(const char *text);
 
+/* the p2p lock, for p2p_evidence.c's calls from the game */
+void p2p_lock_enter(void);
+void p2p_lock_leave(void);
+/* this machine's session key, and the host's instance key (which signs its
+Checkpoints), with their public halves (P2P_PUBLIC_KEY_SIZE bytes) */
+struct FppSigner *p2p_session_key(void);
+struct FppSigner *p2p_instance_key(void);
+void p2p_session_public_key(unsigned char *key);
+void p2p_instance_public_key(unsigned char *key);
+/* the peer (its index) whose address the game has (network byte order), or
+-1 */
+int p2p_peer_index_for_address(unsigned long address);
+/* sends the peer an evidence message on its session's reliable channel */
+int p2p_evidence_send(int peer, const void *data, int size);
+
+/* ---------- p2p_evidence.c: what a host was sent and decided (stage H4) */
+
+/* each pass of the p2p thread (hosting: whether this machine hosts) */
+void p2p_evidence_update(int hosting);
+/* the host: a player admitted (its session key, its slot), or gone */
+void p2p_evidence_peer_admitted(int peer, const unsigned char *session_key, unsigned long slot);
+void p2p_evidence_peer_left(int peer);
+/* a player: the host's instance key, from its session's handshake */
+void p2p_evidence_host_key(int peer, const unsigned char *instance_key);
+/* a message on a session's reliable channel (from_host: on a player) */
+void p2p_evidence_message(int peer, int from_host, const unsigned char *data, int size);
+/* (p2p_evidence_start_match with p2p_lock held) */
+void p2p_evidence_start_match_locked(int is_host, long tick);
+
 /* ---------- p2p_signal.c: signalling through public MQTT brokers */
 
 /* connects to the brokers, if not already; called from the p2p thread */

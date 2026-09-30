@@ -80,7 +80,10 @@ jobs:
         run: python tools/ci_build.py linux release
 
       - name: Test
-        run: python -m pytest -q tools/test_linux_port.py tools/test_network_soak.py
+        run: |
+          python -m pytest -q tools/test_linux_port.py tools/test_network_soak.py
+          # (the Android build's stand-in for every SDK call internet play makes)
+          python tools/fpp_sdk_stub.py --check
 
       # internet play's secure sessions, end to end on one computer: a host,
       # a joiner, and one with a forged host key (no game data needed)
@@ -91,6 +94,11 @@ jobs:
       # D1, none, and a stolen Attestation Result refused
       - name: Trusted games
         run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo --trust
+
+      # the host's evidence (stage H4) and its audit (M4): an honest host is
+      # clean; one that leaves out hit reports' outcomes is caught
+      - name: Evidence
+        run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo --evidence
 
       - name: Compile cache
         run: ccache --show-stats
