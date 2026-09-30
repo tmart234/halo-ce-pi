@@ -49,6 +49,7 @@ Called from the main loop every frame (main.c).
 #include "objects/damage.h"
 #include "scenario/scenario.h"
 #include "physics/collisions.h"
+#include "network_distributed.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -239,8 +240,12 @@ static boolean network_test_cheat_wall_hits(
 sends every client every player's unit, seen or not, so a client that reads
 them knows where players behind walls are. Every second, this logs each
 other living player that no line through the level reaches from this
-machine's player, with where the host says it is. Relevance filtering on
-the host (stage H6) is what makes this come up empty */
+machine's player, with where the host says it is, and how many the host
+no longer says where they are (network.relevance, stage H6: the players it
+withheld). What the radar still sees under relevance is what the host could
+not rule out: those within the motion tracker's reach, and those in the
+part of the level the player's part could see (the level's visibility is
+coarse) */
 static void network_test_cheat_radar(
 	void)
 {
@@ -253,6 +258,8 @@ static void network_test_cheat_radar(
 	char line[2048];
 	int length = 0;
 	int hidden = 0;
+	int withheld = 0;
+	static long withheld_seen;
 
 	if (!config_boolean("debug.cheat_radar"))
 		return;
@@ -290,14 +297,24 @@ static void network_test_cheat_radar(
 		{
 			continue;
 		}
+		/* (network.relevance: the host no longer says where it is; what the
+		unit holds is where it was when the host stopped) */
+		if (network_distributed_withheld((short)DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index)))
+		{
+			withheld++;
+			continue;
+		}
 		hidden++;
 		length += snprintf(line + length, sizeof(line) - (size_t)length, " player %ld (%.3f %.3f %.3f)",
 			(long)DATUM_INDEX_TO_ABSOLUTE_INDEX(iterator.datum_index), object->object.position.x,
 			object->object.position.y, object->object.position.z);
 	}
 	hidden_seen += hidden;
+	withheld_seen += withheld;
 	if (hidden)
 		platform_log("cheat: radar sees %d hidden (%ld so far):%s", hidden, hidden_seen, line);
+	if (withheld)
+		platform_log("cheat: radar withheld %d (%ld so far)", withheld, withheld_seen);
 #endif
 }
 

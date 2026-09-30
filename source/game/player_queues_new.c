@@ -1211,6 +1211,15 @@ void update_client_handle_relayed_action(
 	}
 }
 
+void update_client_clear_relayed_action(
+	short player_index)
+{
+	if (player_index < 0 || player_index >= MAXIMUM_NUMBER_OF_PLAYERS)
+		return;
+	update_client_relayed_actions[player_index].valid = FALSE;
+	update_client_relayed_actions[player_index].pending_control_flags = 0;
+}
+
 boolean update_client_distributed_input(
 	short local_player_index,
 	long *tick,

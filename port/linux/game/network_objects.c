@@ -599,6 +599,77 @@ static long distributed_host_placed_object(
 	return object_index;
 }
 
+/* (the host, network.relevance) whether a client is told where a vehicle
+is: one a player rides only if the client is told of one of its riders
+(the vehicle would give away the player the host keeps from it); NONE: no
+client, whether nobody rides it */
+static boolean distributed_vehicle_relevant(
+	long machine_index,
+	long object_index)
+{
+	struct object_datum *object = object_get(object_index);
+	boolean ridden = FALSE;
+	long child_index;
+
+	if (!TEST_FLAG(_object_mask_vehicle, object->object.type))
+		return TRUE;
+	for (child_index = object->object.first_child_object_index; child_index != NONE;
+		child_index = object_get(child_index)->object.next_object_index)
+	{
+		struct unit_datum *rider;
+
+		if (!TEST_FLAG(_object_mask_unit, object_get(child_index)->object.type))
+			continue;
+		rider = unit_get(child_index);
+		if (rider->unit.player_index == NONE || rider->unit.parent_seat_index == NONE)
+			continue;
+		ridden = TRUE;
+		if (machine_index != NONE && network_distributed_relevant(machine_index,
+				(short)DATUM_INDEX_TO_ABSOLUTE_INDEX(rider->unit.player_index)))
+		{
+			return TRUE;
+		}
+	}
+	return !ridden;
+}
+
+/* the states of the vehicles players ride to each client, of those whose
+riders it is told of (network.relevance) */
+static void distributed_host_send_ridden_states(
+	long const *object_indices,
+	short object_count)
+{
+	long machine_indices[HALO_PORT_MAXIMUM_NETWORK_MACHINES];
+	short machine_count = distributed_client_machines(machine_indices, HALO_PORT_MAXIMUM_NETWORK_MACHINES);
+	short limit = MIN(MAXIMUM_ENTRIES_PER_MESSAGE, DATAGRAM_ENTRIES(struct distributed_object_state));
+	short machine;
+
+	for (machine = 0; machine < machine_count; machine++)
+	{
+		struct distributed_object_state_message message;
+		short count = 0;
+		short index;
+
+		for (index = 0; index < object_count; index++)
+		{
+			if (!distributed_vehicle_relevant(machine_indices[machine], object_indices[index]))
+				continue;
+			distributed_state_from_object(object_indices[index], &message.states[count]);
+			if (++count == limit)
+			{
+				distributed_send_to_machine(machine_indices[machine], &message, _distributed_message_object_states,
+					count, (word)(sizeof(message.header) + count * sizeof(struct distributed_object_state)));
+				count = 0;
+			}
+		}
+		if (count)
+		{
+			distributed_send_to_machine(machine_indices[machine], &message, _distributed_message_object_states,
+				count, (word)(sizeof(message.header) + count * sizeof(struct distributed_object_state)));
+		}
+	}
+}
+
 /* where the moving objects are, and a few at rest, round them all (one
 whose last move was lost is put right when its turn comes) */
 static void distributed_host_send_states(
@@ -610,6 +681,10 @@ static void distributed_host_send_states(
 	short resting = 0;
 	long absolute_index;
 	long step;
+	/* (network.relevance) the vehicles players ride, sent to each client
+	apart */
+	static long ridden[MAXIMUM_TRACKED_OBJECTS];
+	short ridden_count = 0;
 
 	for (step = 0; step < 2 * MAXIMUM_TRACKED_OBJECTS; step++)
 	{
@@ -635,6 +710,12 @@ static void distributed_host_send_states(
 			resting++;
 			objects_host_resting_cursor = (absolute_index + 1) % MAXIMUM_TRACKED_OBJECTS;
 		}
+		if (network_distributed_relevance() && !distributed_vehicle_relevant(NONE, object_index) &&
+			ridden_count < MAXIMUM_TRACKED_OBJECTS)
+		{
+			ridden[ridden_count++] = object_index;
+			continue;
+		}
 		distributed_state_from_object(object_index, &message.states[count]);
 		if (++count == limit)
 		{
@@ -650,6 +731,8 @@ static void distributed_host_send_states(
 			(word)(sizeof(message.header) + count * sizeof(struct distributed_object_state)),
 			_distributed_to_clients);
 	}
+	if (ridden_count)
+		distributed_host_send_ridden_states(ridden, ridden_count);
 }
 
 static void distributed_inventory_from_unit(

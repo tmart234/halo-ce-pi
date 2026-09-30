@@ -119,6 +119,12 @@ static const struct config_setting config_settings[] =
 		"prediction with the host's word; \"client\" also takes where a client\n"
 		"says its own player is, within a tolerance (as later Halo engines do,\n"
 		"and open to a modified client). Refer to NETCODE.md." },
+	{ "network.relevance", _config_string, "\"true\"", "HALO_NET_RELEVANCE", _environment_value, _platform_all,
+		"(distributed netcode, the host's) \"true\" tells each client only of the\n"
+		"players its own could perceive (in sight, within the motion tracker's\n"
+		"reach, teammates, the flag's or ball's carrier) and the vehicles they\n"
+		"ride, so a wallhack has nothing to show; \"false\" tells every client of\n"
+		"every player, as the Xbox game did. Refer to NETCODE.md." },
 	{ "network.online", _config_boolean, "true", "HALO_NET_ONLINE", _environment_value, _platform_all,
 		"Internet play: hosting makes an invite link (logged, and put on the\n"
 		"clipboard) that lets whoever has it join over the internet; opening a\n"
