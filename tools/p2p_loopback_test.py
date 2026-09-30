@@ -32,6 +32,7 @@ from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mqtt_test_broker  # noqa: E402
+import fpp_sdk  # noqa: E402
 
 INVITE = re.compile(r"halo://join/[0-9a-zA-Z_-]+")
 
@@ -57,8 +58,9 @@ def wait_for(path: Path, pattern: str, seconds: float) -> Optional[re.Match]:
 
 
 def mmo_checkout() -> Path:
-    local = os.environ.get("HALO_FPP_SOURCE")
-    return Path(local) if local else Path(__file__).resolve().parent.parent / "build/third_party/mmo"
+    """the SDK's source (HALO_FPP_SOURCE, or the pinned commit, fetched if a
+    cached library meant the build never needed it)"""
+    return fpp_sdk.source_checkout()
 
 
 def mint(*args: str) -> str:
