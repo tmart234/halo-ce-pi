@@ -8,12 +8,20 @@ Passes when the joiner and the host log a secure session, keep it, and a
 third copy whose invite has another host key (an impostor's, or a forged
 signalling answer) reaches the host's address but gets no session.
 
-    python tools/p2p_loopback_test.py [--binary build/linux/halo]
+--trust tests the host's trust policy instead (network.minimum_tier 2): a
+joiner with a D2 Attestation Result bound to its session key is admitted;
+one with a D1 result, one with none, and one presenting the first's result
+under its own key are refused. The results come from the SDK's development
+Verifier (cargo run -p fpp-ffi --example mint_ar, in the mmo checkout
+tools/fpp_sdk.py builds from), so it needs Rust.
+
+    python tools/p2p_loopback_test.py [--binary build/linux/halo] [--trust]
 """
 
 import argparse
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -48,11 +56,86 @@ def wait_for(path: Path, pattern: str, seconds: float) -> Optional[re.Match]:
     return None
 
 
+def mmo_checkout() -> Path:
+    local = os.environ.get("HALO_FPP_SOURCE")
+    return Path(local) if local else Path(__file__).resolve().parent.parent / "build/third_party/mmo"
+
+
+def mint(*args: str) -> str:
+    """the SDK's development Verifier (examples/mint_ar.rs)"""
+    result = subprocess.run(["cargo", "run", "-q", "--release", "--locked", "-p", "fpp-ffi", "--example", "mint_ar",
+                             "--", *args], cwd=mmo_checkout(), check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def trust_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
+    """the host's trust policy: who is admitted and who is refused"""
+    failures = []
+    verifier = secrets.token_hex(32)
+    work.mkdir(parents=True, exist_ok=True)
+    joiners = {}
+    for name in ("trusted", "low", "none", "stolen"):
+        seed = secrets.token_hex(32)
+        (work / f"{name}.seed").write_text(seed)
+        joiners[name] = {"seed": seed, "public": mint("session", seed)}
+    mint("ar", verifier, joiners["trusted"]["public"], "2", str(work / "trusted.ar"))
+    mint("ar", verifier, joiners["low"]["public"], "1", str(work / "low.ar"))
+    processes = []
+    try:
+        host = start(args.binary, work / "host", {**common, "HALO_NET_ADDRESS": "127.0.0.200",
+                                                  "HALO_NETWORK_TEST": "host:bloodgulch",
+                                                  "HALO_NET_MINIMUM_TIER": "2",
+                                                  "HALO_NET_VERIFIER_KEYS": mint("key", verifier)}, [])
+        processes.append(host)
+        invite = wait_for(work / "host" / "stdout.txt", INVITE.pattern, 20)
+        if not invite:
+            return ["the host made no invite"]
+        attestations = {"trusted": "trusted.ar", "low": "low.ar", "none": "", "stolen": "trusted.ar"}
+        for index, name in enumerate(joiners):
+            env = {**common, "HALO_NET_ADDRESS": f"127.0.0.{201 + index}", "HALO_NETWORK_TEST": "join",
+                   "HALO_NET_SESSION_KEY": str(work / f"{name}.seed")}
+            if attestations[name]:
+                env["HALO_NET_ATTESTATION"] = str(work / attestations[name])
+            processes.append(start(args.binary, work / name, env, [invite.group(0)]))
+        checks = [
+            ("trusted", r"connected to host \w+ \(secure session\)"),
+            ("host", r"player \w+ is a D2 windows device"),
+            ("low", r"host \w+: admits only more trusted devices"),
+            ("host", r"refused player \w+: a D1 windows device"),
+            ("none", r"host \w+: admits only more trusted devices"),
+            ("host", r"refused player \w+: no attestation"),
+            ("stolen", r"host \w+: could not verify this device's attestation"),
+            ("host", r"refused player \w+: its attestation does not verify \(token: bound to another session key\)"),
+        ]
+        for name, pattern in checks:
+            found = wait_for(work / name / "stdout.txt", pattern, 30)
+            print(f"{'ok  ' if found else 'FAIL'} {name}: {pattern}")
+            if not found:
+                failures.append(f"{name} never logged {pattern!r}")
+        for name in ("low", "none", "stolen"):
+            if "connected to host" in (work / name / "stdout.txt").read_text(errors="replace"):
+                failures.append(f"{name} was admitted")
+        players = len(re.findall(r"connected to player", (work / "host" / "stdout.txt").read_text(errors="replace")))
+        print(f"{'ok  ' if players == 1 else 'FAIL'} host: {players} player admitted")
+        if players != 1:
+            failures.append(f"the host admitted {players} players")
+    finally:
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            try:
+                process.wait(10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    return failures
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", type=Path, default=Path("build/linux/halo"))
     parser.add_argument("--work", type=Path, default=None)
     parser.add_argument("--seconds", type=float, default=40.0)
+    parser.add_argument("--trust", action="store_true", help="test the host's trust policy instead")
     args = parser.parse_args(argv)
 
     work = args.work or Path(tempfile.mkdtemp(prefix="p2p_loopback_"))
@@ -69,6 +152,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         # (not over the LAN: the copies see each other only through the tunnel)
         "HALO_NET_BROADCAST": "127.0.0.254",
     }
+    if args.trust:
+        failures = trust_test(args, work, common)
+        print(f"logs: {work}")
+        for failure in failures:
+            print(f"FAIL: {failure}")
+        print("passed" if not failures else "failed")
+        return 1 if failures else 0
     processes = []
     failures = []
     try:

@@ -141,6 +141,26 @@ static const struct config_setting config_settings[] =
 		"HALO_NET_BROKERS", _environment_value, _platform_all,
 		"Public MQTT brokers through which the machines of an invite find each\n"
 		"other (its messages are encrypted); comma-separated host:port." },
+	{ "network.minimum_tier", _config_integer, "0", "HALO_NET_MINIMUM_TIER", _environment_value, _platform_all,
+		"Hosting: the lowest device trust tier a joining machine must prove, 0\n"
+		"to 3 (D0 no evidence, D1 software, D2 hardware-backed key and verified\n"
+		"boot, D3 hardened), with an Attestation Result signed by one of\n"
+		"network.verifier_keys. 0 admits every machine with the invite\n"
+		"(untrusted play); above it, only trusted devices play together." },
+	{ "network.verifier_keys", _config_string, "\"\"", "HALO_NET_VERIFIER_KEYS", _environment_value, _platform_all,
+		"Hosting: the Verifier public keys (64 hexadecimal digits each,\n"
+		"comma-separated) whose Attestation Results network.minimum_tier\n"
+		"accepts." },
+	{ "network.attestation_file", _config_string, "\"\"", "HALO_NET_ATTESTATION", _environment_value, _platform_all,
+		"Joining: a file holding this device's Attestation Result, which a\n"
+		"host with a network.minimum_tier asks for; empty for none (D0). It\n"
+		"must be bound to this machine's session key (network.session_key_file)." },
+	{ "network.session_key_file", _config_string, "\"\"", "HALO_NET_SESSION_KEY", _environment_value, _platform_all,
+		"Internet play's session key (the Ed25519 key a machine proves in\n"
+		"its secure sessions and signs its evidence with): a file holding its\n"
+		"32-byte seed, raw or as 64 hexadecimal digits; empty for a new key each\n"
+		"run. A key in a file is a software key: a Verifier rates it no higher\n"
+		"than D1." },
 	{ "network.stun_servers", _config_string, "\"stun.l.google.com:19302,stun.cloudflare.com:3478\"",
 		"HALO_NET_STUN", _environment_value, _platform_all,
 		"Public STUN servers that tell this machine its internet address;\n"

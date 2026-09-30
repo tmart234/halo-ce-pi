@@ -66,6 +66,7 @@ threads only look up and create stand-ins.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum
 {
@@ -83,10 +84,16 @@ enum
 	SESSION_HELLO_VERSION = 1,
 	SESSION_HELLO_SIZE = 1 + P2P_IDENTIFIER_SIZE,
 	/* why a session ends (fpp_types::Reason): none (it left), an identifier
-	that is not its key's (PopInvalid), no room (ServerFull) */
+	that is not its key's (PopInvalid), no room (ServerFull), a device
+	trusted less than the host asks (TierInsufficient), an Attestation
+	Result that does not verify (ArInvalid) */
 	SESSION_REASON_LEFT = 0,
 	SESSION_REASON_REFUSED = 4,
 	SESSION_REASON_FULL = 13,
+	SESSION_REASON_TIER = 5,
+	SESSION_REASON_ATTESTATION = 3,
+	/* the Verifier keys a host's trust policy takes */
+	MAXIMUM_VERIFIER_KEYS = 8,
 
 	/* a host needs a UDP stand-in for two or three ports of every other
 	machine, and a stream for each one's connection */
@@ -182,6 +189,10 @@ struct peer
 	unsigned long endpoint_time;
 	unsigned long retry_time;
 	FppP2pJoiner *joiner;
+	/* its handshake is done; the host admits it (or refuses it, by its
+	trust policy) on the session's first packet, and then sends: until
+	then, it is not connected */
+	int session_up;
 	/* a player (on the host): its number in the host's end */
 	int has_session;
 	uint32_t session;
@@ -275,6 +286,13 @@ static struct
 	unsigned char host_private_key[P2P_PUBLIC_KEY_SIZE];
 	unsigned char host_public_key[P2P_PUBLIC_KEY_SIZE];
 	FppP2pHost *host;
+	/* its trust policy (network.minimum_tier): the lowest device tier it
+	admits, and the Verifier keys whose Attestation Results it takes */
+	int minimum_tier;
+	unsigned char verifier_keys[MAXIMUM_VERIFIER_KEYS][P2P_PUBLIC_KEY_SIZE];
+	int verifier_key_count;
+	/* why admits() last refused: the tier (else the result itself) */
+	int last_refusal_tier;
 	char invite[P2P_LINK_SIZE];
 	int invite_copied;
 	int reported_peer_count;
@@ -442,6 +460,62 @@ static int would_block(void)
 	return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
 }
 
+/* 32 bytes from 64 hexadecimal digits (spaces and line ends around them
+allowed) */
+static int parse_key(const char *text, unsigned char *key)
+{
+	int index;
+
+	while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+		text++;
+	for (index = 0; index < P2P_PUBLIC_KEY_SIZE; index++)
+	{
+		int high = hex_value(text[index * 2]);
+		int low = high < 0 ? -1 : hex_value(text[index * 2 + 1]);
+
+		if (low < 0)
+			return 0;
+		key[index] = (unsigned char)(high << 4 | low);
+	}
+	return hex_value(text[P2P_PUBLIC_KEY_SIZE * 2]) < 0;
+}
+
+/* a file's bytes (at most maximum); their count, or -1 */
+static int read_file_bytes(const char *path, unsigned char *bytes, int maximum)
+{
+	FILE *file = fopen(path, "rb");
+	int size;
+
+	if (!file)
+		return -1;
+	size = (int)fread(bytes, 1, (size_t)maximum, file);
+	if (size == maximum && fgetc(file) != EOF)
+		size = -1;
+	fclose(file);
+	return size;
+}
+
+/* a 32-byte seed from a file: raw, or 64 hexadecimal digits */
+static int read_key_file(const char *path, unsigned char *key)
+{
+	unsigned char bytes[160];
+	int size = read_file_bytes(path, bytes, (int)sizeof(bytes) - 1);
+
+	if (size == P2P_PUBLIC_KEY_SIZE)
+	{
+		memcpy(key, bytes, P2P_PUBLIC_KEY_SIZE);
+		return 1;
+	}
+	if (size > 0)
+	{
+		bytes[size] = 0;
+		if (parse_key((const char *)bytes, key))
+			return 1;
+	}
+	platform_log("Internet play: %s holds no 32-byte key (raw, or 64 hexadecimal digits)", path);
+	return 0;
+}
+
 /* a machine's identifier from its session key: a hash of it, as a locally
 administered unicast MAC address (XNADDR's abEnet holds one) */
 static void identifier_from_key(const unsigned char *public_key, unsigned char *out)
@@ -466,10 +540,18 @@ const unsigned char *p2p_identifier(void)
 	if (!has_identifier)
 	{
 		unsigned char public_key[P2P_PUBLIC_KEY_SIZE];
+		unsigned char seed[P2P_PUBLIC_KEY_SIZE];
+		const char *seed_file = config_string("network.session_key_file");
+		FppStatus status;
 
-		/* a new session key each run, and the identifier its hash */
-		if (fpp_signer_generate(&session_key) == FPP_STATUS_OK &&
-			fpp_signer_public_key(session_key, public_key) == FPP_STATUS_OK)
+		/* a new session key each run (or network.session_key_file's), and
+		the identifier its hash */
+		if (seed_file[0] && read_key_file(seed_file, seed))
+			status = fpp_signer_from_seed(seed, &session_key);
+		else
+			status = fpp_signer_generate(&session_key);
+		memset(seed, 0, sizeof(seed));
+		if (status == FPP_STATUS_OK && fpp_signer_public_key(session_key, public_key) == FPP_STATUS_OK)
 		{
 			identifier_from_key(public_key, identifier);
 		}
@@ -687,7 +769,7 @@ static void peer_end_joiner(struct peer *peer, int tell)
 {
 	if (!peer->joiner)
 		return;
-	if (tell && peer->connected)
+	if (tell && (peer->connected || peer->session_up))
 	{
 		fpp_p2p_joiner_close(peer->joiner, SESSION_REASON_LEFT);
 		flush_joiner(peer);
@@ -833,8 +915,23 @@ static void probe_received(const unsigned char *probe, int size, const struct so
 		hello[0] = SESSION_HELLO_VERSION;
 		memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
 		peer_end_joiner(peer, 0);
-		status = fpp_p2p_joiner_new(peer->host_public_key, peer->invite_secret, session_key, NULL, 0, hello,
-			sizeof(hello), host_address, sizeof(host_address), &peer->joiner);
+		{
+			/* this device's Attestation Result, for a host with a trust
+			policy (none: D0) */
+			unsigned char attestation[FPP_P2P_MAX_ATTESTATION];
+			const char *path = config_string("network.attestation_file");
+			int attestation_size = path[0] ? read_file_bytes(path, attestation, (int)sizeof(attestation)) : 0;
+
+			if (attestation_size < 0)
+			{
+				platform_log("Internet play: cannot read network.attestation_file %s (at most %d bytes); "
+					"joining without it", path, (int)sizeof(attestation));
+				attestation_size = 0;
+			}
+			status = fpp_p2p_joiner_new(peer->host_public_key, peer->invite_secret, session_key,
+				attestation_size ? attestation : NULL, (size_t)attestation_size, hello, sizeof(hello),
+				host_address, sizeof(host_address), &peer->joiner);
+		}
 		if (status != FPP_STATUS_OK)
 		{
 			platform_log("Internet play: cannot start a session with host %s (%d)", peer->name, (int)status);
@@ -880,6 +977,60 @@ static struct peer *find_session(uint32_t session)
 	return NULL;
 }
 
+/* the host's trust policy (network.minimum_tier): whether it admits the
+machine with this identifier and session key, which presented this
+Attestation Result (attestation_size bytes; none is D0). A result must be
+signed by one of network.verifier_keys, fresh, and bound to the key the
+machine proved in the handshake, so one device's result is no use to
+another */
+static int admits(const unsigned char *joined, const unsigned char *attestation, size_t attestation_size,
+	const unsigned char *key)
+{
+	char name[2 * P2P_IDENTIFIER_SIZE + 1];
+	FppArInfo info;
+	FppStatus status;
+
+	p2p_hex(joined, P2P_IDENTIFIER_SIZE, name);
+	p2p.last_refusal_tier = 0;
+	if (!attestation_size)
+	{
+		if (p2p.minimum_tier <= 0)
+			return 1;
+		p2p.last_refusal_tier = 1;
+		platform_log("Internet play: refused player %s: no attestation (D0; this game admits D%d and above)", name,
+			p2p.minimum_tier);
+		return 0;
+	}
+	if (!p2p.verifier_key_count)
+	{
+		/* (a result nobody here can check counts for nothing: D0) */
+		if (p2p.minimum_tier <= 0)
+			return 1;
+		platform_log("Internet play: refused player %s: no network.verifier_keys to check its attestation", name);
+		return 0;
+	}
+	status = fpp_ar_verify(attestation, attestation_size, &p2p.verifier_keys[0][0], (size_t)p2p.verifier_key_count,
+		key, (uint64_t)time(NULL), (uint8_t)(p2p.minimum_tier > 0 ? p2p.minimum_tier : 0), &info);
+	if (status == FPP_STATUS_OK)
+	{
+		platform_log("Internet play: player %s is a D%d %s device", name, (int)info.tier, (const char *)info.platform);
+		return 1;
+	}
+	if (status == FPP_STATUS_TOKEN_TIER)
+	{
+		p2p.last_refusal_tier = 1;
+		platform_log("Internet play: refused player %s: a D%d %s device (this game admits D%d and above)", name,
+			(int)info.tier, (const char *)info.platform, p2p.minimum_tier);
+		return 0;
+	}
+	/* (an untrusted game takes anyone: a bad result only makes it D0) */
+	if (p2p.minimum_tier <= 0)
+		return 1;
+	platform_log("Internet play: refused player %s: its attestation does not verify (%s)", name,
+		fpp_status_str((int)status));
+	return 0;
+}
+
 /* the host's end: players joining, leaving and sending */
 static void host_events(void)
 {
@@ -903,6 +1054,12 @@ static void host_events(void)
 			{
 				platform_log("Internet play: refused a player whose identifier is not its key's");
 				fpp_p2p_host_disconnect(p2p.host, event.peer, SESSION_REASON_REFUSED);
+				break;
+			}
+			if (!admits(joined, data, event.attestation_len, event.key))
+			{
+				fpp_p2p_host_disconnect(p2p.host, event.peer,
+					p2p.last_refusal_tier ? SESSION_REASON_TIER : SESSION_REASON_ATTESTATION);
 				break;
 			}
 			peer = find_peer(joined);
@@ -982,26 +1139,36 @@ static void joiner_events(struct peer *peer)
 				drop_peer(peer, "its session named another machine");
 				return;
 			}
-			peer->connected = 1;
+			peer->session_up = 1;
 			peer->heard_time = p2p_now();
-			platform_log("Internet play: connected to host %s (secure session)", peer->name);
-			if (p2p.joining && !memcmp(p2p.join_host, peer->identifier, P2P_IDENTIFIER_SIZE))
-			{
-				p2p.joining = 0;
-				p2p_signal_stop_joining();
-			}
-			platform_log("Internet play: the host's game is listed under Multiplayer, System Link");
+			platform_log("Internet play: secure session with host %s; waiting to be admitted", peer->name);
 			break;
 		}
 		case FPP_P2P_EVENT_KIND_DATA:
 			peer->heard_time = p2p_now();
+			/* (the host sends only to machines it admitted) */
+			if (!peer->connected)
+			{
+				peer->connected = 1;
+				platform_log("Internet play: connected to host %s (secure session)", peer->name);
+				if (p2p.joining && !memcmp(p2p.join_host, peer->identifier, P2P_IDENTIFIER_SIZE))
+				{
+					p2p.joining = 0;
+					p2p_signal_stop_joining();
+				}
+				platform_log("Internet play: the host's game is listed under Multiplayer, System Link");
+			}
 			session_data(peer, data, (int)event.data_len);
 			break;
 		case FPP_P2P_EVENT_KIND_HOST_MIGRATED:
 			platform_log("Internet play: host %s moved to another address", peer->name);
 			break;
 		case FPP_P2P_EVENT_KIND_CLOSED:
-			forget_peer(peer, event.reason == SESSION_REASON_REFUSED ? "refused this machine" : "closed the game",
+			forget_peer(peer,
+				event.reason == SESSION_REASON_TIER ? "admits only more trusted devices (network.attestation_file)" :
+				event.reason == SESSION_REASON_ATTESTATION ? "could not verify this device's attestation" :
+				event.reason == SESSION_REASON_FULL ? "is full" :
+				event.reason == SESSION_REASON_REFUSED ? "refused this machine" : "closed the game",
 				0);
 			return;
 		default:
@@ -1051,8 +1218,9 @@ static void update_peers(void)
 		else
 		{
 			/* a joiner's handshake, repeated until the host answers; a path
-			that leads nowhere is given up */
-			if (peer->joiner && elapsed(peer->retry_time, HANDSHAKE_RETRY_INTERVAL))
+			that leads nowhere is given up (a session waiting to be admitted
+			too: a host that never sends has not admitted it) */
+			if (peer->joiner && !peer->session_up && elapsed(peer->retry_time, HANDSHAKE_RETRY_INTERVAL))
 			{
 				fpp_p2p_joiner_retry(peer->joiner);
 				flush_joiner(peer);
@@ -1062,6 +1230,7 @@ static void update_peers(void)
 			{
 				peer_end_joiner(peer, 0);
 				peer->has_endpoint = 0;
+				peer->session_up = 0;
 			}
 			/* probes to every address offered, which open both NATs; a
 			joiner's, with a fresh nonce, until the host answers one */
@@ -2036,6 +2205,35 @@ static int connected_player_count(void)
 	return count;
 }
 
+/* network.minimum_tier and network.verifier_keys, for the run */
+static void load_trust_policy(void)
+{
+	const char *keys = config_string("network.verifier_keys");
+
+	p2p.minimum_tier = (int)config_integer("network.minimum_tier");
+	if (p2p.minimum_tier < 0)
+		p2p.minimum_tier = 0;
+	if (p2p.minimum_tier > 3)
+		p2p.minimum_tier = 3;
+	p2p.verifier_key_count = 0;
+	while (*keys && p2p.verifier_key_count < MAXIMUM_VERIFIER_KEYS)
+	{
+		while (*keys == ',' || *keys == ' ')
+			keys++;
+		if (!*keys)
+			break;
+		if (parse_key(keys, p2p.verifier_keys[p2p.verifier_key_count]))
+			p2p.verifier_key_count++;
+		else
+			platform_log("Internet play: network.verifier_keys holds something that is not a key: %.16s...", keys);
+		while (*keys && *keys != ',')
+			keys++;
+	}
+	if (p2p.minimum_tier > 0)
+		platform_log("Internet play: this game admits devices of tier D%d and above (%d Verifier keys)",
+			p2p.minimum_tier, p2p.verifier_key_count);
+}
+
 static void update_hosting(void)
 {
 	int want = p2p.hosting_socket >= 0;
@@ -2062,6 +2260,7 @@ static void update_hosting(void)
 			p2p_sha256(input, sizeof(input), invite_secret);
 			hello[0] = SESSION_HELLO_VERSION;
 			memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
+			load_trust_policy();
 			status = fpp_p2p_keypair_generate(p2p.host_private_key, p2p.host_public_key);
 			if (status == FPP_STATUS_OK)
 			{

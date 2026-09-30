@@ -370,6 +370,32 @@ player:
   player cannot take the identifier of another player.
 - An invite operates while the copy of the game that made it operates.
 
+### Trusted games
+
+A host can admit only trusted devices. Trusted devices play with trusted
+devices, and other devices play with other devices:
+
+- `network.minimum_tier` is the lowest device tier that the host admits:
+  0 (all devices, the default), 1, 2 or 3. Tier 2 is a device whose
+  session key is in hardware and whose boot is verified.
+- A device proves its tier with an Attestation Result from a Verifier (the
+  `mmo` repository). The result is bound to the session key of the device.
+  Thus a result is useless on another device.
+- `network.verifier_keys` holds the public keys of the Verifiers that the
+  host trusts.
+- A joining device gives its result in `network.attestation_file`. A device
+  without a result is tier 0.
+- The host refuses a device below its tier, a device without a result, and
+  a result that does not verify (expired, from an unknown Verifier, or for
+  another session key). The device logs why.
+
+Enter `python tools/p2p_loopback_test.py --trust` to test the policy on
+one computer. The test uses a development Verifier from the SDK.
+
+At this time, no build of the game can get a tier 2 result. Windows needs
+TPM attestation, and Android and iOS need the SDK in their builds, with the
+session key in the phone's hardware. These are the next steps.
+
 The SDK is Rust. `tools/fpp_sdk.py` builds it from a pinned commit of the
 `mmo` repository for the Linux and Windows builds. Install Rust (rustup)
 and its target first: `rustup target add i686-unknown-linux-gnu` (Linux)
