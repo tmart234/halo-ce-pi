@@ -35,9 +35,9 @@ You need Rust (rustup) with the 32-bit target, for the SDK of internet
 play: `rustup target add i686-unknown-linux-gnu`. Refer to "Internet play".
 
 1. Go to the root folder of the repository.
-2. Enter `python configure.py`. The first time, this builds the SDK from
-   the `mmo` repository (`tools/fpp_sdk.py`).
-3. Enter `ninja linux`.
+2. Enter `python configure.py`.
+3. Enter `ninja linux`. The first time, this also builds the SDK from the
+   `mmo` repository (`tools/fpp_sdk.py`).
 
 ## Start the game
 

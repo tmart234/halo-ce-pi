@@ -13,6 +13,9 @@ fetching the pinned commit (for work on both at once). Its header must
 match the vendored one.
 
     python tools/fpp_sdk.py linux     # builds, and prints the library's path
+
+The build files run it as a ninja step (ninja linux, ninja windows), so
+configuring needs no Rust, and a build of another port never runs it.
 """
 
 import os
@@ -78,6 +81,13 @@ def source_checkout() -> Path:
     _run(["git", "fetch", "-q", "--depth", "1", "origin", COMMIT], checkout)
     _run(["git", "checkout", "-q", "--detach", COMMIT], checkout)
     return checkout
+
+
+def library_path(platform: str) -> Path:
+    """where build() leaves a platform's library, relative to the repository
+    (for the build files, which build it with a rule that runs this script)"""
+    target, name = TARGETS[platform]
+    return (THIRD_PARTY / "fpp" / target / name).relative_to(ROOT)
 
 
 def build(platform: str) -> Path:

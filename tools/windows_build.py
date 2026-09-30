@@ -244,11 +244,8 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
         print(f"Windows build disabled: cannot fetch SDL3 ({error})", file=sys.stderr)
         return
     # internet play's secure sessions (the fpp SDK, tools/fpp_sdk.py), built
-    # from its pinned source
-    try:
-        fpp_library = fpp_sdk.build("windows")
-    except fpp_sdk.SdkError as error:
-        raise SystemExit(f"error: {error}")
+    # from its pinned source by a step of ninja windows
+    fpp_library = fpp_sdk.library_path("windows")
     linux_config: Dict[str, Any] = json.loads((LINUX_DIR / "port.json").read_text(encoding="utf-8"))
     config = _load_config()
 
@@ -288,6 +285,15 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
         rspfile="$out.rsp",
         rspfile_content="$in_newline",
     )
+    n.rule(
+        name="windows_fpp_sdk",
+        command="$python tools/fpp_sdk.py windows",
+        description="WINDOWS FPP SDK $out",
+        pool="console",
+        restat=True,
+    )
+    n.build(outputs=fpp_library, rule="windows_fpp_sdk",
+            implicit=[Path("tools/fpp_sdk.py"), fpp_sdk.INCLUDE / "fpp.h"])
     n.rule(
         name="windows_copy",
         command="$python -c \"import shutil,sys; shutil.copyfile(sys.argv[1], sys.argv[2])\" $in $out",

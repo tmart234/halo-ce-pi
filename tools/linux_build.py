@@ -344,12 +344,19 @@ def generate_linux_build(n: Writer, sln: Any) -> None:
     excluded = set(config.get("exclude_sources", []))
     libs = " ".join(f"-l{lib}" for lib in config.get("libraries", []))
     # internet play's secure sessions (the fpp SDK, tools/fpp_sdk.py): built
-    # from its pinned source, and linked by path (with -lfpp the linker
-    # would take a libfpp.so it found first)
-    try:
-        fpp_library = fpp_sdk.build("linux")
-    except fpp_sdk.SdkError as error:
-        raise SystemExit(f"error: {error}")
+    # from its pinned source by a step of ninja linux (configure.py writes
+    # every port's build, and the others need no Rust), and linked by path
+    # (with -lfpp the linker would take a libfpp.so it found first)
+    fpp_library = fpp_sdk.library_path("linux")
+    n.rule(
+        name="linux_fpp_sdk",
+        command="$python tools/fpp_sdk.py linux",
+        description="LINUX FPP SDK $out",
+        pool="console",
+        restat=True,
+    )
+    n.build(outputs=fpp_library, rule="linux_fpp_sdk",
+            implicit=[Path("tools/fpp_sdk.py"), fpp_sdk.INCLUDE / "fpp.h"])
     libs = " ".join([_quote(fpp_library), libs, *(f"-l{lib}" for lib in fpp_sdk.LINUX_LIBRARIES)])
 
     def emit(obj_dir: Path, output: Path, extra_cflags: List[str], extra_ldflags: List[str],

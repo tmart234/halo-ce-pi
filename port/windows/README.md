@@ -23,8 +23,8 @@ You do not need the Xbox SDK.
   from the `mmo` repository, which is Rust (`tools/fpp_sdk.py`).
 - Git and a network connection for the first build. `configure.py`
   downloads the Visual C++ development package of SDL 3.4.16 to
-  `build/windows/third_party`, and builds the SDK from its pinned commit
-  in `build/third_party`.
+  `build/windows/third_party`, and `ninja windows` builds the SDK from its
+  pinned commit in `build/third_party`.
 
 ## Build the game
 
