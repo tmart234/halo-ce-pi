@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 from .linux_build import (LINUX_PROFILE, MINIUPNPC_DEFINES, MINIUPNPC_DIR, MUSL_MATH_DIR, XDK_INCLUDE,
                           compile_launcher, miniupnpc_sources, musl_math_sources, pgo_mode, pgo_profile,
                           profile_use_flags, xdk_headers)
+from .fpp_sdk import INCLUDE as FPP_INCLUDE
 from .ninja_syntax import Writer
 
 PORT_DIR = Path("port/android")
@@ -414,6 +415,8 @@ def generate_android_build(n: Writer, sln: Any) -> None:
         f"-include {prefix_header}", f"-include {platform_semantics_header}",
         f"-I{LINUX_DIR}/src", f"-I{LINUX_DIR}/include", f"-I{PORT_DIR}/guest/runtime",
         f"-I{PORT_DIR}/include", f"-I{TOML_DIR}", f"-I{KCP_DIR}", "-Isource -Isource/cseries",
+        # internet play's SDK header; no SDK (p2p_sdk_none.c): internet play is off
+        f"-I{FPP_INCLUDE}",
         f"-I{SDL_DIR}/include", f"-I{gl_include}", *libc_includes, f"-idirafter {XDK_INCLUDE}",
     ])
     guest_host_only = {"memory_watch.c"}  # replaced by guest_memory_watch.c

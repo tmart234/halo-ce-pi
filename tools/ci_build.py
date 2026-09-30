@@ -89,6 +89,10 @@ def main() -> int:
         # the self-updater's TLS (port/third_party/mbedtls), whose Apache
         # license asks the same
         shutil.copy2(ROOT / "port/third_party/mbedtls/LICENSE", dist / "mbedtls-LICENSE.txt")
+    if args.platform in ("linux", "windows"):
+        # internet play's secure sessions (port/third_party/fpp: the fpp SDK,
+        # tools/fpp_sdk.py), whose MIT license asks for its notice
+        shutil.copy2(ROOT / "port/third_party/fpp/LICENSE", dist / "fpp-LICENSE.txt")
     # internet play's UPnP (port/third_party/miniupnpc), in every build,
     # whose BSD license asks binaries to carry its notice
     shutil.copy2(ROOT / "port/third_party/miniupnpc/LICENSE", dist / "miniupnpc-LICENSE.txt")

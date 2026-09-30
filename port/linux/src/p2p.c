@@ -4,16 +4,18 @@ P2P.C
 Internet play: machines that shared an invite reach each other's system
 link games as if they were on one LAN, without a server of this project's.
 
-- An invite is a link, halo://join/<host><token>: the hosting machine's
-  random identifier (which its XNADDR also carries) and a random 16-byte
-  token. A machine makes one when its game starts hosting (the game listens
-  for connections), logs it, puts it on the clipboard, and offers it through
+- An invite is a link, halo://join/<host><token><key>: the hosting
+  machine's identifier (which its XNADDR also carries), a random 16-byte
+  token, and the public half of the host's static X25519 key for this run.
+  A machine makes one when its game starts hosting (the game listens for
+  connections), logs it, puts it on the clipboard, and offers it through
   Discord (p2p_discord.c). Nothing about a game is published anywhere else:
   without an invite there is no way to find or join it.
 - Signalling (p2p_signal.c) goes through public MQTT brokers, on topics
   that are hashes of the token, with messages sealed with a key derived
   from it (p2p_crypto.c). A joiner offers the addresses it can be reached
-  at; the host answers with its own and a key for their tunnel.
+  at; the host answers with its own. Every invite holder can read these:
+  they carry addresses, never keys.
 - The tunnel is one UDP socket. Each machine learns its public address from
   public STUN servers, and both then send to each other's addresses until
   packets get through (hole punching). There is no relay: two machines whose
@@ -23,8 +25,22 @@ link games as if they were on one LAN, without a server of this project's.
   with its invite, and a joiner asks its own when it has not reached the
   host in a few seconds (network.allow_upnp); the forwarded port is one more
   of the addresses a machine offers (the joiner asks the host again every
-  few seconds until they meet, and the host answers with them all). Every
-  tunnel packet is sealed with the pair's key.
+  few seconds until they meet, and the host answers with them all). The
+  punching is done with probes that carry only a machine's identifier and a
+  random nonce; they find a path, and prove nothing.
+- Everything else on the tunnel is a secure session of the Fair-Play
+  Protocol SDK (libfpp from the mmo repository, tools/fpp_sdk.py; its
+  fpp_p2p_* calls), between the host and each joiner: a Noise IK handshake
+  in which the joiner authenticates the host by the key in the invite, so
+  each pair has keys of its own that no other invite holder can derive
+  (finding H03 of the mmo repository's docs/anticheat/08); packet counters
+  with a replay window, and an address change only after the peer answers a
+  challenge at the new address (H04); vetted cryptography (H05). The token
+  only authorizes a join (the session's invite secret is derived from it).
+  A machine's identifier is a hash of its session key (the Ed25519 key that
+  will sign its evidence), which the joiner proves it holds in the
+  handshake, so a player cannot take another's identifier, and with it
+  their place in the game.
 - Each peer gets a virtual address in 100.64.0.0/10, which the game sees
   (XNetXnAddrToInAddr maps the peer's XNADDR to it). xnet.c rewrites the
   game's destinations there to local stand-ins: a UDP socket here per peer
@@ -44,6 +60,7 @@ threads only look up and create stand-ins.
 #include "port_config.h"
 #include "p2p_internal.h"
 #include "ikcp.h"
+#include "fpp.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -52,12 +69,24 @@ threads only look up and create stand-ins.
 
 enum
 {
-	TUNNEL_MAGIC = 0x68,
-	TUNNEL_HEADER_SIZE = 1 + P2P_IDENTIFIER_SIZE,
-	/* a tunnel packet's plaintext: a type, and at most the game's largest
-	datagram (WSAStartup's iMaxUdpDg) with its ports */
+	/* a hole punching probe: the magic, its type, the sender's identifier
+	and a nonce (a session's packets start with 1 to 5) */
+	PROBE_MAGIC = 0x68,
+	PROBE_NONCE_SIZE = 8,
+	PROBE_SIZE = 2 + P2P_IDENTIFIER_SIZE + PROBE_NONCE_SIZE,
+	/* a session datagram's plaintext: a type, and at most the game's
+	largest datagram (WSAStartup's iMaxUdpDg) with its ports */
 	MAXIMUM_INNER_SIZE = 1400,
-	MAXIMUM_PACKET_SIZE = TUNNEL_HEADER_SIZE + MAXIMUM_INNER_SIZE + P2P_SEAL_OVERHEAD,
+	/* a session's address: struct p2p_candidate's address and port */
+	SESSION_ADDRESS_SIZE = 6,
+	/* the hello each end of a session sends: a version, and its identifier */
+	SESSION_HELLO_VERSION = 1,
+	SESSION_HELLO_SIZE = 1 + P2P_IDENTIFIER_SIZE,
+	/* why a session ends (fpp_types::Reason): none (it left), an identifier
+	that is not its key's (PopInvalid), no room (ServerFull) */
+	SESSION_REASON_LEFT = 0,
+	SESSION_REASON_REFUSED = 4,
+	SESSION_REASON_FULL = 13,
 
 	/* a host needs a UDP stand-in for two or three ports of every other
 	machine, and a stream for each one's connection */
@@ -75,7 +104,11 @@ enum
 	LOOP_INTERVAL = 10,
 	PUNCH_INTERVAL = 200,
 	PING_INTERVAL = 1000,
-	ENDPOINT_SWITCH_TIME = 3000,
+	/* a joiner repeats its handshake this often until the host answers;
+	a path a probe found that has not led to a session in this long is
+	given up, and probing starts again (the probe may have been forged) */
+	HANDSHAKE_RETRY_INTERVAL = 500,
+	HANDSHAKE_TIMEOUT = 6000,
 	PEER_TIMEOUT = 20000,
 	PUNCH_TIMEOUT = 30000,
 	JOIN_TIMEOUT = 90000,
@@ -95,13 +128,20 @@ enum
 	HANDOFF_PORT = 47315,
 };
 
+/* a probe's type */
+enum
+{
+	_probe_ping = 'P',
+	_probe_pong = 'Q',
+};
+
+/* what a session datagram carries */
 enum
 {
 	_packet_ping = 1,
 	_packet_pong,
 	_packet_datagram,
 	_packet_stream,
-	_packet_bye,
 };
 
 /* the messages of a stream, inside KCP */
@@ -126,16 +166,27 @@ struct peer
 	int used;
 	unsigned char identifier[P2P_IDENTIFIER_SIZE];
 	char name[2 * P2P_IDENTIFIER_SIZE + 1];
-	unsigned char key[P2P_SHA256_SIZE];
 	unsigned long virtual_address;
 	int is_host;
+	/* its session is up */
 	int connected;
 	struct p2p_candidate candidates[P2P_MAXIMUM_CANDIDATES];
 	int candidate_count;
+	/* the host (on a joiner): the invite's key and secret, the address a
+	probe was answered from, and this machine's end of the session */
+	unsigned char host_public_key[P2P_PUBLIC_KEY_SIZE];
+	unsigned char invite_secret[P2P_SHA256_SIZE];
+	unsigned char probe_nonce[PROBE_NONCE_SIZE];
+	int has_endpoint;
 	struct p2p_candidate endpoint;
+	unsigned long endpoint_time;
+	unsigned long retry_time;
+	FppP2pJoiner *joiner;
+	/* a player (on the host): its number in the host's end */
+	int has_session;
+	uint32_t session;
 	unsigned long offered_time;
 	unsigned long heard_time;
-	unsigned long endpoint_heard_time;
 	unsigned long sent_time;
 	unsigned long round_trip;
 };
@@ -220,6 +271,10 @@ static struct
 	int hosting;
 	int has_token;
 	unsigned char token[P2P_TOKEN_SIZE];
+	/* its static key for the run, and the host's end of every session */
+	unsigned char host_private_key[P2P_PUBLIC_KEY_SIZE];
+	unsigned char host_public_key[P2P_PUBLIC_KEY_SIZE];
+	FppP2pHost *host;
 	char invite[P2P_LINK_SIZE];
 	int invite_copied;
 	int reported_peer_count;
@@ -229,6 +284,7 @@ static struct
 	int joining;
 	unsigned char join_host[P2P_IDENTIFIER_SIZE];
 	unsigned char join_token[P2P_TOKEN_SIZE];
+	unsigned char join_host_public_key[P2P_PUBLIC_KEY_SIZE];
 	unsigned long join_time;
 
 	char clipboard[P2P_LINK_SIZE];
@@ -246,6 +302,8 @@ static struct
 
 static unsigned char identifier[P2P_IDENTIFIER_SIZE];
 static int has_identifier;
+/* this machine's session key, whose hash is its identifier */
+static FppSigner *session_key;
 
 /* ---------- helpers */
 
@@ -270,10 +328,18 @@ unsigned long p2p_resolve(const char *host)
 	return address;
 }
 
+/* an automated run (debug.exit_after, a hidden window, no renderer): it
+must not take links or other copies' invites over, and copies of it on one
+computer each join with their own */
+static int automated_run(void)
+{
+	return config_real("debug.exit_after") > 0.0 || config_boolean("debug.hidden_window") ||
+		config_boolean("debug.null_renderer");
+}
+
 void p2p_register_url_scheme(const char *scheme, const char *description)
 {
-	if (config_real("debug.exit_after") > 0.0 || config_boolean("debug.hidden_window") ||
-		config_boolean("debug.null_renderer"))
+	if (automated_run())
 		return;
 	posix_register_url_scheme(scheme, description);
 }
@@ -376,6 +442,21 @@ static int would_block(void)
 	return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS;
 }
 
+/* a machine's identifier from its session key: a hash of it, as a locally
+administered unicast MAC address (XNADDR's abEnet holds one) */
+static void identifier_from_key(const unsigned char *public_key, unsigned char *out)
+{
+	static const char context[16] = "halo-p2p-machine";
+	unsigned char input[sizeof(context) + P2P_PUBLIC_KEY_SIZE];
+	unsigned char digest[P2P_SHA256_SIZE];
+
+	memcpy(input, context, sizeof(context));
+	memcpy(input + sizeof(context), public_key, P2P_PUBLIC_KEY_SIZE);
+	p2p_sha256(input, sizeof(input), digest);
+	memcpy(out, digest, P2P_IDENTIFIER_SIZE);
+	out[0] = (unsigned char)((out[0] & 0xFC) | 0x02);
+}
+
 const unsigned char *p2p_identifier(void)
 {
 	/* its own lock: the p2p thread asks while holding p2p_lock */
@@ -384,10 +465,22 @@ const unsigned char *p2p_identifier(void)
 	pthread_mutex_lock(&identifier_lock);
 	if (!has_identifier)
 	{
-		posix_random_bytes(identifier, sizeof(identifier));
-		/* like a locally administered unicast MAC address, as XNADDR's
-		abEnet holds one */
-		identifier[0] = (unsigned char)((identifier[0] & 0xFC) | 0x02);
+		unsigned char public_key[P2P_PUBLIC_KEY_SIZE];
+
+		/* a new session key each run, and the identifier its hash */
+		if (fpp_signer_generate(&session_key) == FPP_STATUS_OK &&
+			fpp_signer_public_key(session_key, public_key) == FPP_STATUS_OK)
+		{
+			identifier_from_key(public_key, identifier);
+		}
+		else
+		{
+			/* (a build without the SDK: no internet play, p2p_initialize) */
+			fpp_signer_free(session_key);
+			session_key = NULL;
+			posix_random_bytes(identifier, sizeof(identifier));
+			identifier[0] = (unsigned char)((identifier[0] & 0xFC) | 0x02);
+		}
 		has_identifier = 1;
 	}
 	pthread_mutex_unlock(&identifier_lock);
@@ -445,39 +538,121 @@ static unsigned long virtual_address_for(const unsigned char *peer_identifier)
 	}
 }
 
-static void peer_send_to(const struct peer *peer, const struct p2p_candidate *to, const unsigned char *inner,
-	int size)
-{
-	unsigned char packet[MAXIMUM_PACKET_SIZE];
-	struct sockaddr_in address;
-	int sealed;
+/* ---------- sessions (the fpp SDK) */
 
-	if (p2p.tunnel_socket < 0 || size > MAXIMUM_INNER_SIZE)
-		return;
-	packet[0] = TUNNEL_MAGIC;
-	memcpy(packet + 1, identifier, P2P_IDENTIFIER_SIZE);
-	sealed = p2p_seal(peer->key, inner, size, packet + TUNNEL_HEADER_SIZE);
-	make_address(&address, to->address, to->port);
-	posix_socket_sendto(p2p.tunnel_socket, packet, TUNNEL_HEADER_SIZE + sealed, 0, &address, sizeof(address));
+static void put_session_address(unsigned char *bytes, const struct p2p_candidate *address)
+{
+	memcpy(bytes, &address->address, 4);
+	memcpy(bytes + 4, &address->port, 2);
 }
 
-/* to a peer the tunnel has reached; dropped otherwise */
+static int get_session_address(const unsigned char *bytes, size_t size, struct p2p_candidate *address)
+{
+	unsigned int value;
+
+	if (size != SESSION_ADDRESS_SIZE)
+		return 0;
+	memcpy(&value, bytes, 4);
+	address->address = value;
+	memcpy(&address->port, bytes + 4, 2);
+	return 1;
+}
+
+/* the monotonic milliseconds the SDK counts in (p2p_now wraps) */
+static uint64_t session_now(void)
+{
+	static uint64_t now;
+	static unsigned long last;
+	static int started;
+	unsigned long tick = p2p_now();
+
+	if (started)
+		now += (unsigned long)(tick - last);
+	started = 1;
+	last = tick;
+	return now;
+}
+
+static void send_datagram(const struct p2p_candidate *to, const unsigned char *packet, int size)
+{
+	struct sockaddr_in address;
+
+	if (p2p.tunnel_socket < 0)
+		return;
+	make_address(&address, to->address, to->port);
+	posix_socket_sendto(p2p.tunnel_socket, packet, size, 0, &address, sizeof(address));
+}
+
+/* what the sessions queued to send, sent */
+static void flush_host(void)
+{
+	unsigned char to[FPP_P2P_MAX_ADDRESS];
+	unsigned char packet[FPP_P2P_MAX_PACKET];
+	size_t to_size, size;
+
+	while (p2p.host && fpp_p2p_host_poll_transmit(p2p.host, to, sizeof(to), &to_size, packet, sizeof(packet),
+		&size) == FPP_STATUS_OK)
+	{
+		struct p2p_candidate address;
+
+		if (get_session_address(to, to_size, &address))
+			send_datagram(&address, packet, (int)size);
+	}
+}
+
+static void flush_joiner(struct peer *peer)
+{
+	unsigned char to[FPP_P2P_MAX_ADDRESS];
+	unsigned char packet[FPP_P2P_MAX_PACKET];
+	size_t to_size, size;
+
+	while (peer->joiner && fpp_p2p_joiner_poll_transmit(peer->joiner, to, sizeof(to), &to_size, packet,
+		sizeof(packet), &size) == FPP_STATUS_OK)
+	{
+		struct p2p_candidate address;
+
+		if (get_session_address(to, to_size, &address))
+			send_datagram(&address, packet, (int)size);
+	}
+}
+
+/* over the peer's session; dropped if it is not up */
 static void peer_send(struct peer *peer, const unsigned char *inner, int size)
 {
-	if (!peer->connected)
+	if (!peer->connected || size > MAXIMUM_INNER_SIZE)
 		return;
-	peer_send_to(peer, &peer->endpoint, inner, size);
+	if (peer->is_host)
+	{
+		fpp_p2p_joiner_send(peer->joiner, inner, (size_t)size);
+		flush_joiner(peer);
+	}
+	else
+	{
+		fpp_p2p_host_send(p2p.host, peer->session, inner, (size_t)size);
+		flush_host();
+	}
 	peer->sent_time = p2p_now();
 }
 
-static void peer_ping(struct peer *peer, const struct p2p_candidate *to)
+static void peer_ping(struct peer *peer)
 {
 	unsigned char inner[5];
 	unsigned long now = p2p_now();
 
 	inner[0] = _packet_ping;
 	memcpy(inner + 1, &now, 4);
-	peer_send_to(peer, to, inner, sizeof(inner));
+	peer_send(peer, inner, sizeof(inner));
+}
+
+static void probe_send(const unsigned char type, const unsigned char *nonce, const struct p2p_candidate *to)
+{
+	unsigned char probe[PROBE_SIZE];
+
+	probe[0] = PROBE_MAGIC;
+	probe[1] = type;
+	memcpy(probe + 2, identifier, P2P_IDENTIFIER_SIZE);
+	memcpy(probe + 2 + P2P_IDENTIFIER_SIZE, nonce, PROBE_NONCE_SIZE);
+	send_datagram(to, probe, sizeof(probe));
 }
 
 static void stream_free(struct stream *stream);
@@ -507,17 +682,39 @@ static void release_peer_links(int peer_index, int streams_only)
 	}
 }
 
-static void drop_peer(struct peer *peer, const char *reason)
+/* this machine's end of a session to the host, if any, stopped */
+static void peer_end_joiner(struct peer *peer, int tell)
+{
+	if (!peer->joiner)
+		return;
+	if (tell && peer->connected)
+	{
+		fpp_p2p_joiner_close(peer->joiner, SESSION_REASON_LEFT);
+		flush_joiner(peer);
+	}
+	fpp_p2p_joiner_free(peer->joiner);
+	peer->joiner = NULL;
+}
+
+/* tell: say goodbye (not when the peer said it first) */
+static void forget_peer(struct peer *peer, const char *reason, int tell)
 {
 	platform_log("Internet play: %s %s: %s", peer->is_host ? "host" : "player", peer->name, reason);
-	if (peer->connected)
+	if (peer->is_host)
+		peer_end_joiner(peer, tell);
+	else if (peer->has_session && p2p.host)
 	{
-		unsigned char bye = _packet_bye;
-
-		peer_send(peer, &bye, 1);
+		if (tell)
+			fpp_p2p_host_disconnect(p2p.host, peer->session, SESSION_REASON_LEFT);
+		flush_host();
 	}
 	release_peer_links((int)(peer - p2p.peers), 0);
 	memset(peer, 0, sizeof(*peer));
+}
+
+static void drop_peer(struct peer *peer, const char *reason)
+{
+	forget_peer(peer, reason, 1);
 }
 
 static void add_candidates(struct peer *peer, const struct p2p_candidate *candidates, int count)
@@ -543,88 +740,133 @@ static void add_candidates(struct peer *peer, const struct p2p_candidate *candid
 	}
 }
 
-void p2p_peer_offered(const unsigned char *peer_identifier, const unsigned char *key,
-	const struct p2p_candidate *candidates, int count, int is_host)
+static struct peer *new_peer(const unsigned char *peer_identifier, int is_host)
+{
+	struct peer *peer;
+	int index;
+
+	for (index = 0; index < P2P_MAXIMUM_PEERS && p2p.peers[index].used; index++)
+		;
+	if (index == P2P_MAXIMUM_PEERS)
+	{
+		platform_log("Internet play: too many players; one more was turned away");
+		return NULL;
+	}
+	peer = &p2p.peers[index];
+	memset(peer, 0, sizeof(*peer));
+	peer->used = 1;
+	memcpy(peer->identifier, peer_identifier, P2P_IDENTIFIER_SIZE);
+	p2p_hex(peer_identifier, P2P_IDENTIFIER_SIZE, peer->name);
+	peer->virtual_address = virtual_address_for(peer_identifier);
+	peer->is_host = is_host;
+	peer->offered_time = p2p_now();
+	return peer;
+}
+
+void p2p_peer_offered(const unsigned char *peer_identifier, const struct p2p_candidate *candidates, int count,
+	int is_host)
 {
 	struct peer *peer = find_peer(peer_identifier);
 
 	if (!memcmp(peer_identifier, identifier, P2P_IDENTIFIER_SIZE))
 		return;
-	if (peer && memcmp(peer->key, key, P2P_SHA256_SIZE))
-	{
-		/* a new session with the same machine: what the old one carried is
-		gone */
-		release_peer_links((int)(peer - p2p.peers), 1);
-		memcpy(peer->key, key, P2P_SHA256_SIZE);
-		peer->connected = 0;
-		peer->candidate_count = 0;
-		peer->offered_time = p2p_now();
-	}
+	/* a host is one this machine holds an invite of: its key is the
+	invite's (never one from signalling, which every invite holder can
+	send) */
+	if (is_host && (!p2p.joining || memcmp(peer_identifier, p2p.join_host, P2P_IDENTIFIER_SIZE)))
+		return;
+	if (peer && peer->is_host != is_host)
+		return;
 	if (!peer)
 	{
-		int index;
-
-		for (index = 0; index < P2P_MAXIMUM_PEERS && p2p.peers[index].used; index++)
-			;
-		if (index == P2P_MAXIMUM_PEERS)
-		{
-			platform_log("Internet play: too many players; one more was turned away");
+		peer = new_peer(peer_identifier, is_host);
+		if (!peer)
 			return;
-		}
-		peer = &p2p.peers[index];
-		memset(peer, 0, sizeof(*peer));
-		peer->used = 1;
-		memcpy(peer->identifier, peer_identifier, P2P_IDENTIFIER_SIZE);
-		p2p_hex(peer_identifier, P2P_IDENTIFIER_SIZE, peer->name);
-		memcpy(peer->key, key, P2P_SHA256_SIZE);
-		peer->virtual_address = virtual_address_for(peer_identifier);
-		peer->is_host = is_host;
-		peer->offered_time = p2p_now();
 		platform_log("Internet play: reaching %s %s", is_host ? "host" : "player", peer->name);
 	}
+	if (is_host && !peer->connected)
+	{
+		unsigned char input[P2P_TOKEN_SIZE + 16];
+
+		memcpy(peer->host_public_key, p2p.join_host_public_key, P2P_PUBLIC_KEY_SIZE);
+		/* the session's invite secret, from the token (as the host makes it) */
+		memcpy(input, p2p.join_token, P2P_TOKEN_SIZE);
+		memcpy(input + P2P_TOKEN_SIZE, "halo-p2p-invite", 16);
+		p2p_sha256(input, sizeof(input), peer->invite_secret);
+	}
+	/* (asked again: it is still trying) */
+	if (!peer->connected)
+		peer->offered_time = p2p_now();
 	add_candidates(peer, candidates, count);
 }
 
-static void peer_heard(struct peer *peer, unsigned long address, unsigned short port)
+/* a probe: a ping answered with a pong to where it came from; a pong from
+the host, to this machine's ping, is where to start its session */
+static void probe_received(const unsigned char *probe, int size, const struct sockaddr_in *from)
 {
-	unsigned long now = p2p_now();
-	int same = peer->endpoint.address == address && peer->endpoint.port == port;
+	struct peer *peer;
+	struct p2p_candidate address;
 
-	peer->heard_time = now;
-	if (!peer->connected)
+	if (size != PROBE_SIZE)
+		return;
+	/* only machines signalling offered (the host answers no stranger) */
+	peer = find_peer(probe + 2);
+	if (!peer)
+		return;
+	address.address = from->sin_addr.s_addr;
+	address.port = from->sin_port;
+	if (probe[1] == _probe_ping)
+		probe_send(_probe_pong, probe + 2 + P2P_IDENTIFIER_SIZE, &address);
+	else if (probe[1] == _probe_pong && peer->is_host && !peer->has_endpoint && !peer->connected &&
+		!memcmp(probe + 2 + P2P_IDENTIFIER_SIZE, peer->probe_nonce, PROBE_NONCE_SIZE))
 	{
 		char text[32];
+		unsigned char host_address[SESSION_ADDRESS_SIZE];
+		unsigned char hello[SESSION_HELLO_SIZE];
+		FppStatus status;
 
-		peer->connected = 1;
-		peer->endpoint.address = address;
-		peer->endpoint.port = port;
-		peer->endpoint_heard_time = now;
-		platform_log("Internet play: connected to %s %s at %s", peer->is_host ? "host" : "player", peer->name,
-			address_text(address, port, text));
-		if (peer->is_host)
+		peer->has_endpoint = 1;
+		peer->endpoint = address;
+		peer->endpoint_time = p2p_now();
+		peer->retry_time = p2p_now();
+		put_session_address(host_address, &address);
+		hello[0] = SESSION_HELLO_VERSION;
+		memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
+		peer_end_joiner(peer, 0);
+		status = fpp_p2p_joiner_new(peer->host_public_key, peer->invite_secret, session_key, NULL, 0, hello,
+			sizeof(hello), host_address, sizeof(host_address), &peer->joiner);
+		if (status != FPP_STATUS_OK)
 		{
-			if (p2p.joining && !memcmp(p2p.join_host, peer->identifier, P2P_IDENTIFIER_SIZE))
-			{
-				p2p.joining = 0;
-				p2p_signal_stop_joining();
-			}
-			platform_log("Internet play: the host's game is listed under Multiplayer, System Link");
+			platform_log("Internet play: cannot start a session with host %s (%d)", peer->name, (int)status);
+			peer->joiner = NULL;
+			peer->has_endpoint = 0;
+			return;
 		}
-	}
-	else if (same)
-	{
-		peer->endpoint_heard_time = now;
-	}
-	else if (elapsed(peer->endpoint_heard_time, ENDPOINT_SWITCH_TIME))
-	{
-		/* its address changed (a NAT's mapping, or a better path) */
-		peer->endpoint.address = address;
-		peer->endpoint.port = port;
-		peer->endpoint_heard_time = now;
+		platform_log("Internet play: host %s answers at %s; starting a secure session", peer->name,
+			address_text(address.address, address.port, text));
+		flush_joiner(peer);
 	}
 }
 
-static void update_peers(void)
+static void session_data(struct peer *peer, const unsigned char *inner, int size);
+
+/* a session's identifier (its hello) matches its key: a machine's
+identifier is a hash of its session key */
+static int hello_matches(const unsigned char *hello, size_t size, const unsigned char *key,
+	unsigned char *hello_identifier)
+{
+	unsigned char expected[P2P_IDENTIFIER_SIZE];
+
+	if (size < SESSION_HELLO_SIZE || hello[0] != SESSION_HELLO_VERSION)
+		return 0;
+	memcpy(hello_identifier, hello + 1, P2P_IDENTIFIER_SIZE);
+	if (!key)
+		return 1;
+	identifier_from_key(key, expected);
+	return !memcmp(expected, hello_identifier, P2P_IDENTIFIER_SIZE);
+}
+
+static struct peer *find_session(uint32_t session)
 {
 	int index;
 
@@ -632,17 +874,173 @@ static void update_peers(void)
 	{
 		struct peer *peer = &p2p.peers[index];
 
+		if (peer->used && !peer->is_host && peer->has_session && peer->session == session)
+			return peer;
+	}
+	return NULL;
+}
+
+/* the host's end: players joining, leaving and sending */
+static void host_events(void)
+{
+	FppP2pEvent event;
+	unsigned char data[FPP_P2P_MAX_PACKET];
+
+	while (p2p.host && fpp_p2p_host_poll_event(p2p.host, &event, data, sizeof(data)) == FPP_STATUS_OK)
+	{
+		struct peer *peer = find_session(event.peer);
+
+		switch (event.kind)
+		{
+		case FPP_P2P_EVENT_KIND_PEER_JOINED:
+		{
+			size_t hello_offset = event.attestation_len + event.admit_pop_len;
+			unsigned char joined[P2P_IDENTIFIER_SIZE];
+			char name[2 * P2P_IDENTIFIER_SIZE + 1];
+
+			if (hello_offset > event.data_len || !event.has_key ||
+				!hello_matches(data + hello_offset, event.data_len - hello_offset, event.key, joined))
+			{
+				platform_log("Internet play: refused a player whose identifier is not its key's");
+				fpp_p2p_host_disconnect(p2p.host, event.peer, SESSION_REASON_REFUSED);
+				break;
+			}
+			peer = find_peer(joined);
+			if (peer && peer->is_host)
+			{
+				fpp_p2p_host_disconnect(p2p.host, event.peer, SESSION_REASON_REFUSED);
+				break;
+			}
+			if (!peer)
+				peer = new_peer(joined, 0);
+			if (!peer)
+			{
+				fpp_p2p_host_disconnect(p2p.host, event.peer, SESSION_REASON_FULL);
+				break;
+			}
+			/* the same machine (the same key) again: its new session
+			replaces the old, and what the old carried is gone */
+			if (peer->has_session && peer->session != event.peer)
+			{
+				fpp_p2p_host_disconnect(p2p.host, peer->session, SESSION_REASON_LEFT);
+				release_peer_links((int)(peer - p2p.peers), 1);
+			}
+			peer->has_session = 1;
+			peer->session = event.peer;
+			peer->connected = 1;
+			peer->heard_time = p2p_now();
+			p2p_hex(joined, P2P_IDENTIFIER_SIZE, name);
+			platform_log("Internet play: connected to player %s (secure session %u)", name,
+				(unsigned int)event.peer);
+			break;
+		}
+		case FPP_P2P_EVENT_KIND_DATA:
+			if (peer)
+			{
+				peer->heard_time = p2p_now();
+				session_data(peer, data, (int)event.data_len);
+			}
+			break;
+		case FPP_P2P_EVENT_KIND_PEER_MIGRATED:
+			if (peer)
+				platform_log("Internet play: player %s moved to another address", peer->name);
+			break;
+		case FPP_P2P_EVENT_KIND_PEER_LEFT:
+			if (peer)
+			{
+				peer->has_session = 0;
+				forget_peer(peer, "left", 0);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+	flush_host();
+}
+
+/* this machine's end of a session to the host */
+static void joiner_events(struct peer *peer)
+{
+	FppP2pEvent event;
+	unsigned char data[FPP_P2P_MAX_PACKET];
+
+	while (peer->used && peer->joiner &&
+		fpp_p2p_joiner_poll_event(peer->joiner, &event, data, sizeof(data)) == FPP_STATUS_OK)
+	{
+		switch (event.kind)
+		{
+		case FPP_P2P_EVENT_KIND_CONNECTED:
+		{
+			unsigned char host[P2P_IDENTIFIER_SIZE];
+
+			/* (the key was the invite's, which the handshake proved; the
+			hello must name the same machine) */
+			if (!hello_matches(data, event.data_len, NULL, host) ||
+				memcmp(host, peer->identifier, P2P_IDENTIFIER_SIZE))
+			{
+				drop_peer(peer, "its session named another machine");
+				return;
+			}
+			peer->connected = 1;
+			peer->heard_time = p2p_now();
+			platform_log("Internet play: connected to host %s (secure session)", peer->name);
+			if (p2p.joining && !memcmp(p2p.join_host, peer->identifier, P2P_IDENTIFIER_SIZE))
+			{
+				p2p.joining = 0;
+				p2p_signal_stop_joining();
+			}
+			platform_log("Internet play: the host's game is listed under Multiplayer, System Link");
+			break;
+		}
+		case FPP_P2P_EVENT_KIND_DATA:
+			peer->heard_time = p2p_now();
+			session_data(peer, data, (int)event.data_len);
+			break;
+		case FPP_P2P_EVENT_KIND_HOST_MIGRATED:
+			platform_log("Internet play: host %s moved to another address", peer->name);
+			break;
+		case FPP_P2P_EVENT_KIND_CLOSED:
+			forget_peer(peer, event.reason == SESSION_REASON_REFUSED ? "refused this machine" : "closed the game",
+				0);
+			return;
+		default:
+			break;
+		}
+	}
+	if (peer->used)
+		flush_joiner(peer);
+}
+
+static void update_peers(void)
+{
+	uint64_t now = session_now();
+	int index;
+
+	if (p2p.host)
+	{
+		fpp_p2p_host_tick(p2p.host, now);
+		host_events();
+	}
+	for (index = 0; index < P2P_MAXIMUM_PEERS; index++)
+	{
+		struct peer *peer = &p2p.peers[index];
+
 		if (!peer->used)
 			continue;
+		if (peer->joiner)
+		{
+			fpp_p2p_joiner_tick(peer->joiner, now);
+			joiner_events(peer);
+			if (!peer->used)
+				continue;
+		}
 		if (peer->connected)
 		{
 			if (elapsed(peer->heard_time, PEER_TIMEOUT))
 				drop_peer(peer, "lost the connection");
 			else if (elapsed(peer->sent_time, PING_INTERVAL))
-			{
-				peer_ping(peer, &peer->endpoint);
-				peer->sent_time = p2p_now();
-			}
+				peer_ping(peer);
 		}
 		else if (elapsed(peer->offered_time, PUNCH_TIMEOUT))
 		{
@@ -650,13 +1048,33 @@ static void update_peers(void)
 				"connection; forwarding network.tunnel_port on one router helps, as UPnP does where the "
 				"router allows it: network.allow_upnp)");
 		}
-		else if (elapsed(peer->sent_time, PUNCH_INTERVAL))
+		else
 		{
-			int candidate;
+			/* a joiner's handshake, repeated until the host answers; a path
+			that leads nowhere is given up */
+			if (peer->joiner && elapsed(peer->retry_time, HANDSHAKE_RETRY_INTERVAL))
+			{
+				fpp_p2p_joiner_retry(peer->joiner);
+				flush_joiner(peer);
+				peer->retry_time = p2p_now();
+			}
+			if (peer->has_endpoint && elapsed(peer->endpoint_time, HANDSHAKE_TIMEOUT))
+			{
+				peer_end_joiner(peer, 0);
+				peer->has_endpoint = 0;
+			}
+			/* probes to every address offered, which open both NATs; a
+			joiner's, with a fresh nonce, until the host answers one */
+			if (elapsed(peer->sent_time, PUNCH_INTERVAL))
+			{
+				int candidate;
 
-			for (candidate = 0; candidate < peer->candidate_count; candidate++)
-				peer_ping(peer, &peer->candidates[candidate]);
-			peer->sent_time = p2p_now();
+				if (peer->is_host && !peer->has_endpoint)
+					posix_random_bytes(peer->probe_nonce, PROBE_NONCE_SIZE);
+				for (candidate = 0; candidate < peer->candidate_count; candidate++)
+					probe_send(_probe_ping, peer->probe_nonce, &peer->candidates[candidate]);
+				peer->sent_time = p2p_now();
+			}
 		}
 	}
 }
@@ -1375,42 +1793,25 @@ static void stream_writeable(struct stream *stream)
 
 /* ---------- the tunnel */
 
-static void tunnel_received(const unsigned char *packet, int size, const struct sockaddr_in *from)
+/* what a session carried: the game's traffic and the tunnel's pings */
+static void session_data(struct peer *peer, const unsigned char *inner, int size)
 {
-	unsigned char inner[MAXIMUM_INNER_SIZE + P2P_SEAL_OVERHEAD];
-	struct peer *peer;
-	int inner_size;
-
-	if (size >= 20 && packet[4] == 0x21 && packet[5] == 0x12 && packet[6] == 0xA4 && packet[7] == 0x42)
-	{
-		stun_received(packet, size);
+	if (size < 1)
 		return;
-	}
-	if (size < TUNNEL_HEADER_SIZE + P2P_SEAL_OVERHEAD + 1 || packet[0] != TUNNEL_MAGIC ||
-		size - TUNNEL_HEADER_SIZE > (int)sizeof(inner))
-		return;
-	peer = find_peer(packet + 1);
-	if (!peer)
-		return;
-	inner_size = p2p_open(peer->key, packet + TUNNEL_HEADER_SIZE, size - TUNNEL_HEADER_SIZE, inner);
-	if (inner_size < 1)
-		return;
-	peer_heard(peer, from->sin_addr.s_addr, from->sin_port);
 	switch (inner[0])
 	{
 	case _packet_ping:
-		if (inner_size >= 5)
+		if (size >= 5)
 		{
-			struct p2p_candidate to;
+			unsigned char pong[5];
 
-			inner[0] = _packet_pong;
-			to.address = from->sin_addr.s_addr;
-			to.port = from->sin_port;
-			peer_send_to(peer, &to, inner, 5);
+			memcpy(pong, inner, 5);
+			pong[0] = _packet_pong;
+			peer_send(peer, pong, sizeof(pong));
 		}
 		break;
 	case _packet_pong:
-		if (inner_size >= 5)
+		if (size >= 5)
 		{
 			unsigned long sent;
 
@@ -1419,14 +1820,59 @@ static void tunnel_received(const unsigned char *packet, int size, const struct 
 		}
 		break;
 	case _packet_datagram:
-		datagram_received(peer, inner, inner_size);
+		datagram_received(peer, inner, size);
 		break;
 	case _packet_stream:
-		stream_received(peer, inner + 1, inner_size - 1);
+		stream_received(peer, inner + 1, size - 1);
 		break;
-	case _packet_bye:
-		drop_peer(peer, "left");
-		break;
+	}
+}
+
+static void tunnel_received(const unsigned char *packet, int size, const struct sockaddr_in *from)
+{
+	unsigned char address[SESSION_ADDRESS_SIZE];
+	struct p2p_candidate source;
+	int index;
+
+	/* a STUN server's answer (a binding response and the magic cookie) */
+	if (size >= 20 && packet[0] == 0x01 && packet[1] == 0x01 && packet[4] == 0x21 && packet[5] == 0x12 &&
+		packet[6] == 0xA4 && packet[7] == 0x42)
+	{
+		stun_received(packet, size);
+		return;
+	}
+	if (size >= 1 && packet[0] == PROBE_MAGIC)
+	{
+		probe_received(packet, size, from);
+		return;
+	}
+	if (size < 1 || size > FPP_P2P_MAX_PACKET)
+		return;
+	source.address = from->sin_addr.s_addr;
+	source.port = from->sin_port;
+	put_session_address(address, &source);
+	/* a session's packet: its type says whose (a handshake's first half,
+	the host's; its answer or a cookie, a joiner's; data, either's, by its
+	receiver's index). What fails is dropped: counted by the SDK, never a
+	reason to disconnect anyone */
+	if (p2p.host && (packet[0] == 1 || packet[0] == 3 || packet[0] == 5))
+	{
+		FppStatus status = fpp_p2p_host_recv(p2p.host, address, sizeof(address), packet, (size_t)size);
+
+		host_events();
+		if (status != FPP_STATUS_P2P_UNKNOWN_SESSION || packet[0] != 3)
+			return;
+	}
+	for (index = 0; index < P2P_MAXIMUM_PEERS; index++)
+	{
+		struct peer *peer = &p2p.peers[index];
+
+		if (peer->used && peer->joiner &&
+			fpp_p2p_joiner_recv(peer->joiner, address, sizeof(address), packet, (size_t)size) == FPP_STATUS_OK)
+		{
+			joiner_events(peer);
+			return;
+		}
 	}
 }
 
@@ -1449,10 +1895,11 @@ static void tunnel_readable(void)
 
 /* ---------- invites */
 
-/* the host identifier and token in an invite link or code within text */
-static int parse_invite(const char *text, unsigned char *host, unsigned char *token)
+/* the host identifier, token and host key in an invite link or code
+within text */
+static int parse_invite(const char *text, unsigned char *host, unsigned char *token, unsigned char *host_key)
 {
-	unsigned char bytes[P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE];
+	unsigned char bytes[P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE + P2P_PUBLIC_KEY_SIZE];
 	const char *start = NULL;
 	const char *search;
 	int index;
@@ -1499,16 +1946,17 @@ static int parse_invite(const char *text, unsigned char *host, unsigned char *to
 		return 0;
 	memcpy(host, bytes, P2P_IDENTIFIER_SIZE);
 	memcpy(token, bytes + P2P_IDENTIFIER_SIZE, P2P_TOKEN_SIZE);
+	memcpy(host_key, bytes + P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE, P2P_PUBLIC_KEY_SIZE);
 	return 1;
 }
 
 /* under p2p_lock */
 static int join_invite(const char *text)
 {
-	unsigned char host[P2P_IDENTIFIER_SIZE], token[P2P_TOKEN_SIZE];
+	unsigned char host[P2P_IDENTIFIER_SIZE], token[P2P_TOKEN_SIZE], host_key[P2P_PUBLIC_KEY_SIZE];
 	struct peer *peer;
 
-	if (!parse_invite(text, host, token))
+	if (!parse_invite(text, host, token, host_key))
 		return 0;
 	if (!memcmp(host, identifier, P2P_IDENTIFIER_SIZE))
 		return 1;
@@ -1519,10 +1967,11 @@ static int join_invite(const char *text)
 		return 1;
 	}
 	if ((p2p.joining || p2p.join_requested) && !memcmp(host, p2p.join_host, sizeof(host)) &&
-		!memcmp(token, p2p.join_token, sizeof(token)))
+		!memcmp(token, p2p.join_token, sizeof(token)) && !memcmp(host_key, p2p.join_host_public_key, sizeof(host_key)))
 		return 1;
 	memcpy(p2p.join_host, host, sizeof(host));
 	memcpy(p2p.join_token, token, sizeof(token));
+	memcpy(p2p.join_host_public_key, host_key, sizeof(host_key));
 	p2p.join_requested = 1;
 	return 1;
 }
@@ -1542,7 +1991,12 @@ int p2p_join_invite(const char *text)
 
 void p2p_invite_received(const char *text)
 {
-	if (!join_invite(text))
+	if (join_invite(text))
+		return;
+	if (strstr(text, "halo://join/"))
+		platform_log("Internet play: that invite is from another version of the game (the host and this "
+			"machine must both have a version with secure sessions)");
+	else
 		platform_log("Internet play: that is not an invite");
 }
 
@@ -1588,18 +2042,43 @@ static void update_hosting(void)
 
 	if (want && !p2p.hosting)
 	{
-		char text[2 * (P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE) + 1];
+		char text[2 * (P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE + P2P_PUBLIC_KEY_SIZE) + 1];
 
-		/* one invite for the whole run, so a link keeps working from game
-		to game */
+		/* one invite (and key, and the host's end of every session) for
+		the whole run, so a link keeps working from game to game */
 		if (!p2p.has_token)
 		{
-			unsigned char bytes[P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE];
+			unsigned char bytes[P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE + P2P_PUBLIC_KEY_SIZE];
+			unsigned char input[P2P_TOKEN_SIZE + 16];
+			unsigned char invite_secret[P2P_SHA256_SIZE];
+			unsigned char hello[SESSION_HELLO_SIZE];
+			FppStatus status;
 
 			posix_random_bytes(p2p.token, sizeof(p2p.token));
+			/* the joiners' invite secret, from the token: it authorizes a
+			join, and is never a key */
+			memcpy(input, p2p.token, P2P_TOKEN_SIZE);
+			memcpy(input + P2P_TOKEN_SIZE, "halo-p2p-invite", 16);
+			p2p_sha256(input, sizeof(input), invite_secret);
+			hello[0] = SESSION_HELLO_VERSION;
+			memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
+			status = fpp_p2p_keypair_generate(p2p.host_private_key, p2p.host_public_key);
+			if (status == FPP_STATUS_OK)
+			{
+				status = fpp_p2p_host_new(p2p.host_private_key, invite_secret, NULL, hello, sizeof(hello),
+					P2P_MAXIMUM_PEERS, &p2p.host);
+			}
+			memset(invite_secret, 0, sizeof(invite_secret));
+			if (status != FPP_STATUS_OK)
+			{
+				platform_log("Internet play: cannot host (the secure session failed to start: %d)", (int)status);
+				p2p.host = NULL;
+				return;
+			}
 			p2p.has_token = 1;
 			memcpy(bytes, identifier, P2P_IDENTIFIER_SIZE);
 			memcpy(bytes + P2P_IDENTIFIER_SIZE, p2p.token, P2P_TOKEN_SIZE);
+			memcpy(bytes + P2P_IDENTIFIER_SIZE + P2P_TOKEN_SIZE, p2p.host_public_key, P2P_PUBLIC_KEY_SIZE);
 			p2p_hex(bytes, sizeof(bytes), text);
 			snprintf(p2p.invite, sizeof(p2p.invite), "halo://join/%s", text);
 		}
@@ -1791,9 +2270,9 @@ static int command_line_invite(char *text, int size)
 
 	for (index = 1; posix_command_line_argument(index, text, (posix_ulong)size); index++)
 	{
-		unsigned char host[P2P_IDENTIFIER_SIZE], token[P2P_TOKEN_SIZE];
+		unsigned char host[P2P_IDENTIFIER_SIZE], token[P2P_TOKEN_SIZE], host_key[P2P_PUBLIC_KEY_SIZE];
 
-		if (parse_invite(text, host, token))
+		if (parse_invite(text, host, token, host_key))
 			return 1;
 	}
 	return 0;
@@ -1811,7 +2290,7 @@ int p2p_hand_off_invite(void)
 	int attempt;
 	int result = 0;
 
-	if (!command_line_invite(invite, sizeof(invite)))
+	if (automated_run() || !command_line_invite(invite, sizeof(invite)))
 		return 0;
 	socket = open_socket(SOCK_DGRAM, network_long(0x7F000001), 0, NULL);
 	if (socket < 0)
@@ -2013,6 +2492,12 @@ void p2p_initialize(unsigned long local_address)
 	p2p_identifier();
 	if (p2p.running || !config_boolean("network.online"))
 		return;
+	if (!session_key)
+	{
+		/* (the tunnel has no other way to be secure: none at all) */
+		platform_log("Internet play is off: this build has no secure sessions (the fpp SDK)");
+		return;
+	}
 	for (index = 0; index < MAXIMUM_PROXIES; index++)
 		p2p.proxies[index].socket = -1;
 	for (index = 0; index < MAXIMUM_LISTENERS; index++)
@@ -2040,7 +2525,8 @@ void p2p_initialize(unsigned long local_address)
 #ifndef HALO_ANDROID
 	/* the first copy of the game takes the invites later ones are opened
 	with */
-	p2p.handoff_socket = open_socket(SOCK_DGRAM, network_long(0x7F000001), network_short(HANDOFF_PORT), NULL);
+	if (!automated_run())
+		p2p.handoff_socket = open_socket(SOCK_DGRAM, network_long(0x7F000001), network_short(HANDOFF_PORT), NULL);
 	p2p_register_url_scheme("halo", "Halo: Combat Evolved invite");
 #endif
 	stun_setup();

@@ -18,9 +18,13 @@ You do not need the Xbox SDK.
   SDK. It does not use the MSVC compiler.
 - LLVM (clang and lld), Python 3 and ninja in the `PATH`. For example,
   enter `scoop install llvm python ninja`.
-- A network connection for the first build. `configure.py` downloads the
-  Visual C++ development package of SDL 3.4.16 to
-  `build/windows/third_party`.
+- Rust (rustup) with the 32-bit target: `rustup target add
+  i686-pc-windows-msvc`. Internet play uses the Fair-Play Protocol SDK
+  from the `mmo` repository, which is Rust (`tools/fpp_sdk.py`).
+- Git and a network connection for the first build. `configure.py`
+  downloads the Visual C++ development package of SDL 3.4.16 to
+  `build/windows/third_party`, and `ninja windows` builds the SDK from its
+  pinned commit in `build/third_party`.
 
 ## Build the game
 

@@ -31,9 +31,13 @@ To start the game:
 
 ## Build the game
 
+You need Rust (rustup) with the 32-bit target, for the SDK of internet
+play: `rustup target add i686-unknown-linux-gnu`. Refer to "Internet play".
+
 1. Go to the root folder of the repository.
 2. Enter `python configure.py`.
-3. Enter `ninja linux`.
+3. Enter `ninja linux`. The first time, this also builds the SDK from the
+   `mmo` repository (`tools/fpp_sdk.py`).
 
 ## Start the game
 
@@ -180,6 +184,9 @@ the setting for one start of the game. It has priority over the file.
 | `debug.network_test`, `debug.network_test_start`, `debug.network_test_kill`, `debug.network_test_shoot`, `debug.network_test_vehicle`, `debug.network_test_pickup`, `debug.test_input` | off | `HALO_NETWORK_TEST`, `HALO_NETWORK_TEST_START`, `HALO_NETWORK_TEST_KILL`, `HALO_NETWORK_TEST_SHOOT`, `HALO_NETWORK_TEST_VEHICLE`, `HALO_NETWORK_TEST_PICKUP`, `HALO_TEST_INPUT` | Automatic tests of system link (`game/network_test.c`). Refer to `NETCODE.md`. |
 | `debug.cheat_movement_step` | `0.0` | `HALO_CHEAT_MOVEMENT_STEP` | Debug builds only. A red-team client for tests: each report of where its own player is goes this number of world units ahead of the player. `0`: off. Refer to "Host authority" in `NETCODE.md`. |
 | `debug.cheat_wall_hits` | `false` | `HALO_CHEAT_WALL_HITS` | Debug builds only. A red-team client for tests: `debug.network_test_shoot` hits through walls, and the host rejects those hits. Refer to "Host authority" in `NETCODE.md`. |
+| `debug.cheat_damage` | `""` | `HALO_CHEAT_DAMAGE` | Debug builds only. A red-team client for tests: its hit reports forge the damage (`scale`, `multiplier`, `kill`, `area`), and the host rejects them. Refer to "Host authority" in `NETCODE.md`. |
+| `debug.cheat_radar` | `false` | `HALO_CHEAT_RADAR` | Debug builds only. A red-team client for tests: logs where the players it cannot see are, from what the host sends. Refer to "Host authority" in `NETCODE.md`. |
+| `debug.cheat_host_immunity` | `false` | `HALO_CHEAT_HOST_IMMUNITY` | Debug builds only. A red-team host for tests: drops the hits of clients on its own players. Refer to "Host authority" in `NETCODE.md`. |
 | `debug.network_latency`, `debug.network_loss` | `0` | `HALO_NETWORK_LATENCY`, `HALO_NETWORK_LOSS` | The game holds all the data that it receives for this number of milliseconds, and ignores this percentage of the datagrams. Use these settings to test the netcode as on the internet. |
 
 With Mesa drivers, the game sends its GL calls through the GL thread of
@@ -319,14 +326,14 @@ Machines with an invite link can play system link on the internet. This
 project has no server.
 
 When a copy of the game starts to host a system link game, it makes an
-invite link: `halo://join/<44 hexadecimal digits>`. The game writes the link
+invite link: `halo://join/<108 hexadecimal digits>`. The game writes the link
 to the standard error and puts it on the clipboard.
 
 To join a game, do one of these steps:
 
 - Open the link. The game is the handler of `halo://` links. If the game
   already operates, the new copy gives the link to it and stops.
-- Copy the link (or the 44 digits) and go to the game.
+- Copy the link (or the 108 digits) and go to the game.
 - Enter `halo <link>`.
 - Accept a Discord invite. Refer to "Discord".
 
@@ -338,20 +345,49 @@ network does not need an invite.
 
 Only machines with the invite can find the game:
 
-- The link contains the identifier of the host and a random 16-byte token.
+- The link contains the identifier of the host, a random 16-byte token and
+  the public key of the host (X25519, new each time the game starts).
 - The machines exchange their addresses through public MQTT brokers
   (`network.signalling_brokers`). The topics are HMACs of the token. A key
   from the token encrypts and authenticates the messages
-  (`src/p2p_signal.c`, `src/p2p_crypto.c`).
-- A key from the host encrypts and authenticates each packet between two
-  machines.
+  (`src/p2p_signal.c`, `src/p2p_crypto.c`). The messages contain only
+  addresses.
+
+A player with the invite cannot read or change the traffic of another
+player:
+
+- The host and each player make a secure session with the Fair-Play
+  Protocol SDK (`fpp_p2p_*`, from the `mmo` repository): a Noise IK
+  handshake (`Noise_IK_25519_ChaChaPoly_SHA256`). The player makes sure of
+  the host with the key in the invite. Each pair of machines gets its own
+  keys. The token only gives permission to join.
+- Each packet has a counter. The session drops a packet that it saw
+  before (replay).
+- The session sends to a new address only after the machine at that
+  address answers a challenge.
+- The identifier of a machine is a hash of its session key. The host
+  refuses a machine whose identifier is not the hash of its key. Thus a
+  player cannot take the identifier of another player.
 - An invite operates while the copy of the game that made it operates.
+
+The SDK is Rust. `tools/fpp_sdk.py` builds it from a pinned commit of the
+`mmo` repository for the Linux and Windows builds. Install Rust (rustup)
+and its target first: `rustup target add i686-unknown-linux-gnu` (Linux)
+or `rustup target add i686-pc-windows-msvc` (Windows). The Android build
+has no SDK, so internet play is off on Android. An invite from a version
+before the secure sessions does not operate.
+
+To test internet play on one computer (no game data is necessary), enter
+`python tools/p2p_loopback_test.py`. The test uses a local MQTT broker
+(`tools/mqtt_test_broker.py`).
 
 ### Connection
 
 Each machine gets its public address from public STUN servers. Then the two
-machines send packets to each other until the packets get through (UDP hole
-punching). There is no relay.
+machines send probes to each other until the probes get through (UDP hole
+punching). A probe contains only the identifier of the machine and a random
+number. Then the player starts the secure session at the address that
+answered. There is no relay.
 
 Some networks give a different port for each destination (for example some
 mobile and company networks). Two machines behind such networks cannot
