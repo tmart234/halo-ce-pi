@@ -18,6 +18,10 @@ and the machines' logs say:
 - ``host_immunity``: the host runs debug.cheat_host_immunity. Passes when it
   dropped hits on its own player: the attack works, as it will until
   evidence and the replay auditor (H4) prove it.
+- ``forged_scale``, ``forged_multiplier``, ``forged_kill``, ``forged_area``: one
+  client runs debug.cheat_damage, its hit reports claiming ten times the
+  damage, a kill-instantly flag, or a bullet as an explosion. Passes when
+  the host rejects them for that reason, and nothing else.
 
 The cheats are in debug builds only (ninja linux). You need the game's data:
 --data is the folder holding maps/ (paths.data). Each copy gets a folder of
@@ -41,7 +45,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-SCENARIOS = ("soak", "movement", "wall_hits", "radar", "host_immunity")
+# debug.cheat_damage's forgeries, and the reason the host rejects each with
+FORGERIES = {
+    "forged_scale": ("scale", "forged_scale"),
+    "forged_multiplier": ("multiplier", "forged_scale"),
+    "forged_kill": ("kill", "forged_flags"),
+    "forged_area": ("area", "forged_area"),
+}
+SCENARIOS = ("soak", "movement", "wall_hits", "radar", "host_immunity", *FORGERIES)
 FIRST_ADDRESS = 200
 # the copies' own files in a data root, which each keeps apart
 OWN_FILES = {"debug.txt", "signals.jsonl", "config.toml"}
@@ -123,6 +134,8 @@ def plan(args: argparse.Namespace, scenario: str, work: Path) -> List[Machine]:
                     env["HALO_CHEAT_WALL_HITS"] = "1"
                 elif scenario == "radar":
                     env["HALO_CHEAT_RADAR"] = "1"
+                elif scenario in FORGERIES:
+                    env["HALO_CHEAT_DAMAGE"] = FORGERIES[scenario][0]
         machines.append(Machine(name, address, env, make_root(work, f"{scenario}/{name}", args.data)))
     return machines
 
@@ -188,6 +201,14 @@ def judge(scenario: str, machines: List[Machine]) -> Result:
         seen = re.findall(r"cheat: radar sees (\d+) hidden", clients[-1].log)
         total = sum(int(count) for count in seen)
         return Result(scenario, total > 0, details + [f"the radar saw {total} hidden players (H06 open until H6)"])
+    if scenario in FORGERIES:
+        reason = FORGERIES[scenario][1]
+        rejected_forged = kinds.get(f"hit_report_rejected:{reason}", 0)
+        others = [key for key in kinds if key.startswith("hit_report_rejected:") and key != f"hit_report_rejected:{reason}"]
+        if others:
+            details.append(f"other rejections (false rejects of the honest client?): {others}")
+        return Result(scenario, rejected_forged > 0 and not others,
+                      details + [f"{rejected_forged} forged hits rejected as {reason}"])
     if scenario == "host_immunity":
         dropped = len(re.findall(r"cheat: host immunity dropped", host.log))
         return Result(scenario, dropped > 0,

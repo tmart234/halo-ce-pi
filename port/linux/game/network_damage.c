@@ -57,6 +57,7 @@ boolean tag_index_is_group(long tag_index, long group_tag);
 /* port_config.c's */
 #ifndef HALO_RELEASE
 int config_boolean(char const *name);
+char const *config_string(char const *name);
 void platform_log(char const *format, ...);
 #endif
 
@@ -114,6 +115,33 @@ host's word on it) */
 #define REPORT_HISTORY_LEAD_TICKS 3.0f
 /* world units short of a hit a path test stops (the hit is on a surface) */
 #define PATH_END_SLACK 0.25f
+/* world units from where the host had a melee attacker to its target (a
+lunge's reach, and the attacker's and target's copies apart) */
+#define MELEE_REACH 4.0f
+/* the most a report's damage scale may be: the engine's own scales run from
+0 to 1 (a projectile's by its speed, an explosion's by distance), but for a
+melee blow from the air (units.c: 1.5) */
+#define MAXIMUM_DAMAGE_SCALE 1.0f
+#define MAXIMUM_MELEE_DAMAGE_SCALE 1.5f
+
+/* how a player's weapons deal a damage effect (distributed_player_deals) */
+enum
+{
+	/* a projectile's impact (a bullet) */
+	_deals_impact_bit = 0,
+	/* an explosion: a detonation, an effect's damage, a vehicle's */
+	_deals_area_bit,
+	/* a weapon's melee blow */
+	_deals_melee_bit,
+};
+
+/* the flags a client's report may carry: what the engine sets on a
+player's own shots before the host deals them. The rest the engine sets
+only on the host, or for deaths no player deals (a fall, the game's), and a
+report carrying one is forged: kill instantly (a one-shot kill), bypasses
+shields, silent, no statistics (a kill that does not count) */
+#define REPORT_DAMAGE_FLAGS (FLAG(_damage_area_of_effect_bit) | FLAG(_damage_create_localized_effect_bit) | \
+	FLAG(_damage_from_weapon_bit) | FLAG(_damage_damaged_one_object_bit))
 
 /* the host's struct damage_data, as the other machines have it */
 struct distributed_damage
@@ -328,6 +356,27 @@ static boolean distributed_damage_to_data(
 
 /* ---------- object_cause_damage (damage.c) */
 
+/* (debug builds) the red-team client of the damage checks: its reports
+carry what a modified client would put there (debug.cheat_damage) */
+static void distributed_cheat_damage(
+	struct distributed_damage *damage)
+{
+#ifndef HALO_RELEASE
+	char const *cheat = config_string("debug.cheat_damage");
+
+	if (!strcmp(cheat, "scale"))
+		damage->scale = 10.0f;
+	else if (!strcmp(cheat, "multiplier"))
+		damage->multiplier = 10.0f;
+	else if (!strcmp(cheat, "kill"))
+		SET_FLAG(damage->flags, _damage_kill_instantly_bit, TRUE);
+	else if (!strcmp(cheat, "area"))
+		SET_FLAG(damage->flags, _damage_area_of_effect_bit, TRUE);
+#else
+	(void)damage;
+#endif
+}
+
 /* whether this machine deals the damage: a client none (it reports its own
 players' hits instead), the host all but its clients' players' (but for
 their reports); authorized: a client carrying out the host's word */
@@ -355,6 +404,7 @@ boolean network_damage_deals(
 			csmemset(report, 0, sizeof(*report));
 			report->object_index = object_index;
 			distributed_damage_from_data(damage, &report->damage);
+			distributed_cheat_damage(&report->damage);
 			/* (in the world: a rider's own position is its seat's) */
 			object_get_origin(object_index, &report->target_position);
 			report->node_index = node_index;
@@ -464,18 +514,21 @@ void network_damage_aftermath(
 /* ---------- the host */
 
 /* what damage a projectile's impacts and detonations deal */
-static boolean distributed_projectile_deals(long projectile_index, long damage_index, short depth);
+static unsigned long distributed_projectile_deals(long projectile_index, long damage_index, short depth);
 
-static boolean distributed_effect_deals(
+/* how the effect deals the damage (_deals_* flags; none if it does not):
+an effect's damage is an explosion's */
+static unsigned long distributed_effect_deals(
 	long effect_index,
 	long damage_index,
 	short depth)
 {
 	struct distributed_effect_definition *effect;
+	unsigned long deals = 0;
 	short event_index;
 
 	if (depth > MAXIMUM_TAG_DEPTH || !tag_index_is_group(effect_index, EFFECT_TAG))
-		return FALSE;
+		return 0;
 	effect = (struct distributed_effect_definition *)tag_get(EFFECT_TAG, effect_index);
 	for (event_index = 0; event_index < effect->events.count; event_index++)
 	{
@@ -490,99 +543,92 @@ static boolean distributed_effect_deals(
 
 			if (part->reference.index == NONE)
 				continue;
-			if (part->reference.index == damage_index ||
-				(part->reference.group_tag == PROJECTILE_DEFINITION_TAG &&
-					distributed_projectile_deals(part->reference.index, damage_index, depth + 1)) ||
-				(part->reference.group_tag == EFFECT_TAG &&
-					distributed_effect_deals(part->reference.index, damage_index, depth + 1)))
-			{
-				return TRUE;
-			}
+			if (part->reference.index == damage_index)
+				deals |= FLAG(_deals_area_bit);
+			else if (part->reference.group_tag == PROJECTILE_DEFINITION_TAG)
+				deals |= distributed_projectile_deals(part->reference.index, damage_index, depth + 1);
+			else if (part->reference.group_tag == EFFECT_TAG)
+				deals |= distributed_effect_deals(part->reference.index, damage_index, depth + 1);
 		}
 	}
-	return FALSE;
+	return deals;
 }
 
-static boolean distributed_projectile_deals(
+static unsigned long distributed_projectile_deals(
 	long projectile_index,
 	long damage_index,
 	short depth)
 {
 	struct projectile_definition *projectile;
+	unsigned long deals = 0;
 	short response_index;
 
 	if (depth > MAXIMUM_TAG_DEPTH || !tag_index_is_group(projectile_index, PROJECTILE_DEFINITION_TAG))
-		return FALSE;
+		return 0;
 	projectile = projectile_definition_get(projectile_index);
+	if (projectile->projectile.impact_damage.index == damage_index)
+		deals |= FLAG(_deals_impact_bit);
 	/* (its effect is the one it detonates with: a grenade's, a rocket's
 	explosion) */
-	if (projectile->projectile.impact_damage.index == damage_index ||
-		projectile->projectile.attached_detonation_damage.index == damage_index ||
-		distributed_effect_deals(projectile->projectile.effect.index, damage_index, depth + 1) ||
-		distributed_effect_deals(projectile->projectile.super_detonation.index, damage_index, depth + 1) ||
-		distributed_effect_deals(projectile->projectile.detonation_started.index, damage_index, depth + 1))
-	{
-		return TRUE;
-	}
+	if (projectile->projectile.attached_detonation_damage.index == damage_index)
+		deals |= FLAG(_deals_area_bit);
+	deals |= distributed_effect_deals(projectile->projectile.effect.index, damage_index, depth + 1);
+	deals |= distributed_effect_deals(projectile->projectile.super_detonation.index, damage_index, depth + 1);
+	deals |= distributed_effect_deals(projectile->projectile.detonation_started.index, damage_index, depth + 1);
 	for (response_index = 0; response_index < projectile->projectile.material_responses.count; response_index++)
 	{
 		struct projectile_material_response_definition *response = TAG_BLOCK_GET_ELEMENT(
 			&projectile->projectile.material_responses, response_index,
 			struct projectile_material_response_definition);
 
-		if (distributed_effect_deals(response->default_effect.index, damage_index, depth + 1) ||
-			distributed_effect_deals(response->potential_effect.index, damage_index, depth + 1) ||
-			distributed_effect_deals(response->detonation_effect.index, damage_index, depth + 1))
-		{
-			return TRUE;
-		}
+		deals |= distributed_effect_deals(response->default_effect.index, damage_index, depth + 1);
+		deals |= distributed_effect_deals(response->potential_effect.index, damage_index, depth + 1);
+		deals |= distributed_effect_deals(response->detonation_effect.index, damage_index, depth + 1);
 	}
-	return FALSE;
+	return deals;
 }
 
-static boolean distributed_weapon_deals(
+static unsigned long distributed_weapon_deals(
 	long weapon_definition_index,
 	long damage_index)
 {
 	struct weapon_definition *weapon;
+	unsigned long deals = 0;
 	short trigger_index;
 
 	if (!tag_index_is_group(weapon_definition_index, WEAPON_DEFINITION_TAG))
-		return FALSE;
+		return 0;
 	weapon = weapon_definition_get(weapon_definition_index);
-	if (weapon->weapon.melee_attack_damage.index == damage_index ||
-		distributed_effect_deals(weapon->weapon.detonation_effect.index, damage_index, 0) ||
-		distributed_effect_deals(weapon->weapon.overheated_effect.index, damage_index, 0))
-	{
-		return TRUE;
-	}
+	if (weapon->weapon.melee_attack_damage.index == damage_index)
+		deals |= FLAG(_deals_melee_bit);
+	deals |= distributed_effect_deals(weapon->weapon.detonation_effect.index, damage_index, 0);
+	deals |= distributed_effect_deals(weapon->weapon.overheated_effect.index, damage_index, 0);
 	for (trigger_index = 0; trigger_index < weapon->weapon.triggers.count; trigger_index++)
 	{
 		struct weapon_trigger_definition *trigger = TAG_BLOCK_GET_ELEMENT(
 			&weapon->weapon.triggers, trigger_index, struct weapon_trigger_definition);
 
-		if (distributed_projectile_deals(trigger->projectile.index, damage_index, 0))
-			return TRUE;
+		deals |= distributed_projectile_deals(trigger->projectile.index, damage_index, 0);
 	}
-	return FALSE;
+	return deals;
 }
 
-/* whether the player could have dealt the damage: their weapons, lately,
-their grenades, their vehicle */
-static boolean distributed_player_deals(
+/* how the player could have dealt the damage (_deals_* flags; none if they
+could not): their weapons, lately, their grenades, their vehicle */
+static unsigned long distributed_player_deals(
 	short player_index,
 	long damage_index)
 {
 	struct game_globals *globals = scenario_get_game_globals();
+	unsigned long deals = 0;
 	short index;
 
 	for (index = 0; index < MAXIMUM_RECENT_WEAPONS; index++)
 	{
 		if (damage_players[player_index].definition_indices[index] != NONE &&
-			game_time_get() - damage_players[player_index].times[index] <= RECENT_WEAPON_TICKS &&
-			distributed_weapon_deals(damage_players[player_index].definition_indices[index], damage_index))
+			game_time_get() - damage_players[player_index].times[index] <= RECENT_WEAPON_TICKS)
 		{
-			return TRUE;
+			deals |= distributed_weapon_deals(damage_players[player_index].definition_indices[index], damage_index);
 		}
 	}
 	for (index = 0; index < globals->grenades.count; index++)
@@ -590,9 +636,9 @@ static boolean distributed_player_deals(
 		struct game_globals_grenade *grenade = TAG_BLOCK_GET_ELEMENT(&globals->grenades, index,
 			struct game_globals_grenade);
 
-		if (distributed_projectile_deals(grenade->projectile.index, damage_index, 0))
-			return TRUE;
+		deals |= distributed_projectile_deals(grenade->projectile.index, damage_index, 0);
 	}
+	/* (a vehicle's: the engine deals it as an explosion, physics.c) */
 	if (game_time_get() - damage_players[player_index].vehicle_time <= RECENT_WEAPON_TICKS &&
 		globals->falling_damage.count > 0)
 	{
@@ -602,10 +648,10 @@ static boolean distributed_player_deals(
 		if (falling_damage->vehicle_killed_unit_damage_effect.index == damage_index ||
 			falling_damage->vehicle_collision_damage.index == damage_index)
 		{
-			return TRUE;
+			deals |= FLAG(_deals_area_bit) | FLAG(_deals_impact_bit);
 		}
 	}
-	return FALSE;
+	return deals;
 }
 
 /* where each player's unit and vehicle are this tick, noted */
@@ -815,6 +861,65 @@ static boolean distributed_path_clear(
 	return !known;
 }
 
+/* whether an explosion reached the target: no level geometry between its
+center and the target (the engine's own test, which the host does not run
+on a reported hit: area_of_effect_cause_damage_to_object in damage.c), or
+the center within the explosion's core of it */
+static boolean distributed_area_path_clear(
+	struct distributed_hit_report const *report,
+	struct damage_effect_definition const *definition)
+{
+	unsigned long flags =
+		FLAG(_collision_test_structure_bit) |
+		FLAG(_collision_test_front_facing_surfaces_bit) |
+		FLAG(_collision_test_ignore_invisible_surfaces_bit) |
+		FLAG(_collision_test_ignore_breakable_surfaces_bit) |
+		FLAG(_collision_test_ignore_two_sided_surfaces_bit);
+	struct collision_result collision;
+	real_vector3d vector;
+	real length;
+	real core = definition->damage.area_of_effect_core_radius + PATH_END_SLACK;
+
+	vector.i = report->target_position.x - report->damage.epicenter.x;
+	vector.j = report->target_position.y - report->damage.epicenter.y;
+	vector.k = report->target_position.z - report->damage.epicenter.z;
+	length = (real)sqrt(vector.i * vector.i + vector.j * vector.j + vector.k * vector.k);
+	if (length <= core)
+		return TRUE;
+	vector.i *= (length - PATH_END_SLACK) / length;
+	vector.j *= (length - PATH_END_SLACK) / length;
+	vector.k *= (length - PATH_END_SLACK) / length;
+	return !collision_test_vector(flags, &report->damage.epicenter, &vector, NONE, &collision);
+}
+
+/* whether the host had the attacker's unit within a blow's reach of the
+target in the last ticks (a melee report's origin is the client's word) */
+static boolean distributed_melee_in_reach(
+	short player_index,
+	struct distributed_hit_report const *report,
+	real target_radius)
+{
+	real reach = MELEE_REACH + target_radius;
+	boolean known = FALSE;
+	long back;
+
+	for (back = 0; back < TARGET_HISTORY_TICKS; back++)
+	{
+		real_point3d attacker;
+		real dx, dy, dz;
+
+		if (!distributed_shooter_position(player_index, back, &attacker))
+			continue;
+		known = TRUE;
+		dx = report->target_position.x - attacker.x;
+		dy = report->target_position.y - attacker.y;
+		dz = report->target_position.z - attacker.z;
+		if (dx * dx + dy * dy + dz * dz <= reach * reach)
+			return TRUE;
+	}
+	return !known;
+}
+
 static char const *distributed_report_rejection(
 	long machine_index,
 	struct distributed_hit_report const *report)
@@ -826,6 +931,8 @@ static char const *distributed_report_rejection(
 	real dx, dy, dz;
 	real impact_distance_squared;
 	real reach;
+	unsigned long deals;
+	boolean area;
 
 	/* that machine's player */
 	if (player_index == NO_PLAYER || player_index >= MAXIMUM_TRACKED_PLAYERS ||
@@ -839,8 +946,26 @@ static char const *distributed_report_rejection(
 	if (!target || !tag_index_is_group(report->damage.definition_index, DAMAGE_EFFECT_DEFINITION_TAG))
 		return "bad_target";
 	/* damage that player could deal */
-	if (!distributed_player_deals(player_index, report->damage.definition_index))
+	deals = distributed_player_deals(player_index, report->damage.definition_index);
+	if (!deals)
 		return "weapon_not_carried";
+	/* as the engine would have it: only the flags a player's own shot
+	carries; an explosion only for damage the weapon deals as one (a
+	bullet marked an explosion would skip the path test and reach further);
+	the scale no more than the engine's (the most a melee blow from the air
+	has), and no multiplier (the engine's is 1 until the host deals it) */
+	area = TEST_FLAG(report->damage.flags, _damage_area_of_effect_bit);
+	if (report->damage.flags & ~(unsigned long)REPORT_DAMAGE_FLAGS)
+		return "forged_flags";
+	if (area && !(deals & (FLAG(_deals_area_bit) | FLAG(_deals_melee_bit))))
+		return "forged_area";
+	if (!(report->damage.scale >= 0.0f) ||
+		report->damage.scale > (TEST_FLAG(deals, _deals_melee_bit) ? MAXIMUM_MELEE_DAMAGE_SCALE : MAXIMUM_DAMAGE_SCALE))
+	{
+		return "forged_scale";
+	}
+	if (report->damage.multiplier != 1.0f)
+		return "forged_scale";
 	/* the target about where the host had it when the shooter saw it: a
 	player's unit or vehicle as far back as the shooter's round trip, else
 	(what no player has) about where it is */
@@ -870,7 +995,7 @@ static char const *distributed_report_rejection(
 	/* the impact at the target (an explosion's within its reach) */
 	definition = damage_effect_definition_get(report->damage.definition_index);
 	reach = target->object.bounding_sphere_radius + REPORT_IMPACT_TOLERANCE;
-	if (TEST_FLAG(report->damage.flags, _damage_area_of_effect_bit))
+	if (area)
 		reach += definition->cutoff_radius;
 	dx = report->damage.origin.x - report->target_position.x;
 	dy = report->damage.origin.y - report->target_position.y;
@@ -883,10 +1008,15 @@ static char const *distributed_report_rejection(
 	if (impact_distance_squared > reach * reach)
 		return "impact_off_target";
 	/* a path the shot could take: no level geometry between where the
-	shooter was and where it hit (explosions reach round corners, and the
-	engine obstructs their damage itself) */
-	if (!TEST_FLAG(report->damage.flags, _damage_area_of_effect_bit) &&
-		!distributed_path_clear(player_index, report))
+	shooter was and where it hit; for an explosion (which reaches round
+	corners from where it went off), between its center and the target; a
+	melee blow, from where the host had the attacker */
+	if (deals == FLAG(_deals_melee_bit))
+	{
+		if (!distributed_melee_in_reach(player_index, report, target->object.bounding_sphere_radius))
+			return "melee_out_of_reach";
+	}
+	else if (area ? !distributed_area_path_clear(report, definition) : !distributed_path_clear(player_index, report))
 	{
 		return "obstructed";
 	}

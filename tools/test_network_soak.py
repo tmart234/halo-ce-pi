@@ -84,3 +84,24 @@ def test_plan_puts_the_cheat_on_the_last_client(tmp_path):
     assert ms[0].env["HALO_NETWORK_TEST"] == "host:bloodgulch"
     assert ms[0].env["HALO_NET_BROADCAST"] == "127.0.0.201,127.0.0.202"
     assert (ms[1].root / "maps").is_symlink() and not (ms[1].root / "debug.txt").exists()
+
+
+def test_forgeries(tmp_path):
+    forged = [{"kind": "hit_report_rejected", "reason": "forged_scale", "count": 4}]
+    ms = machines(tmp_path / "a", status(900, 2, 4), [status(900, 0, 0), status(900, 0, 0)], forged)
+    assert network_soak.judge("forged_scale", ms).passed
+    assert network_soak.judge("forged_multiplier", ms).passed
+    assert not network_soak.judge("forged_kill", ms).passed
+
+    # a false reject of the honest client beside the forgery fails it
+    mixed = forged + [{"kind": "hit_report_rejected", "reason": "obstructed", "count": 1}]
+    ms = machines(tmp_path / "b", status(900, 2, 5), [status(900, 0, 0), status(900, 0, 0)], mixed)
+    assert not network_soak.judge("forged_scale", ms).passed
+
+    area = [{"kind": "hit_report_rejected", "reason": "forged_area", "count": 3}]
+    ms = machines(tmp_path / "c", status(900, 2, 3), [status(900, 0, 0), status(900, 0, 0)], area)
+    assert network_soak.judge("forged_area", ms).passed
+
+    kill = [{"kind": "hit_report_rejected", "reason": "forged_flags", "count": 3}]
+    ms = machines(tmp_path / "d", status(900, 2, 3), [status(900, 0, 0), status(900, 0, 0)], kill)
+    assert network_soak.judge("forged_kill", ms).passed

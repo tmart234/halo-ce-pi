@@ -104,9 +104,28 @@ units short. A report passes if any such ray is clear. The ray tests only
 the level's solid one-sided surfaces. It ignores objects, invisible player
 clipping, breakable glass and two-sided fences and grates, which shots may
 pass. A shooter who had no line to the hit during the last second (a shot
-through a wall) is rejected. Area-of-effect damage is not path-tested:
-explosions reach round corners, and the engine obstructs their damage
-itself.
+through a wall) is rejected. An explosion is tested from where it went
+off to the target (explosions reach round corners from there): the
+engine's own test runs where the explosion is simulated, which for a
+reported hit is the client. A melee blow passes only if the host had the
+attacker within 4 units (and the target's size) of the target in the last
+second.
+
+A report must also carry the damage as the engine makes it, since the
+client chose these numbers before:
+
+- **Flags**: only those a player's own shot carries (an explosion, a
+  localized effect, from a weapon, one object damaged). Kill instantly,
+  bypasses shields, silent and no statistics the engine sets only on the
+  host or for deaths no player deals: `forged_flags`.
+- **An explosion only for damage the weapon deals as one**: a bullet
+  marked an explosion would reach further and skip the path test:
+  `forged_area`.
+- **Scale and multiplier**: the engine's scale runs from 0 to 1 (a
+  projectile's by its speed, an explosion's by distance), 1.5 for a melee
+  blow from the air, and the multiplier is 1 until the host deals the
+  damage. A report claiming more (ten times the damage, a one-shot kill)
+  is `forged_scale`.
 
 ### Signals
 
@@ -121,7 +140,7 @@ Kinds and reasons:
 
 | Kind | Reasons |
 | --- | --- |
-| `hit_report_rejected` | `not_its_player`, `bad_target`, `weapon_not_carried`, `target_not_there`, `impact_off_target`, `obstructed`, `rate`, `bad_damage` |
+| `hit_report_rejected` | `not_its_player`, `bad_target`, `weapon_not_carried`, `forged_flags`, `forged_area`, `forged_scale`, `target_not_there`, `impact_off_target`, `obstructed`, `melee_out_of_reach`, `rate`, `bad_damage` |
 | `position_report_ignored` | `host_authority`: a machine kept sending position reports more than 3 seconds' worth after the host said it decides. A client of this version stops once it has the host's first state. |
 
 The host writes each machine's kind and reason at most once a second, with
@@ -152,6 +171,10 @@ grep obstructed signals.jsonl
 Without the cheat, a soak of scripted bots (with `debug.network_latency`
 and `debug.network_loss`) should show no rejected hits. Any rejected hit
 there is a false reject to fix.
+
+`debug.cheat_damage` (debug builds) forges the client's reports:
+`scale` and `multiplier` (ten times the damage), `kill` (kill instantly),
+`area` (a bullet as an explosion). The host rejects each.
 
 Two more red-team switches (debug builds) show what host authority does
 not fix, for the stages that do:
@@ -184,6 +207,7 @@ python tools/network_soak.py --data ~/halo --scenario soak --minutes 30 --latenc
 | `wall_hits` | `debug.cheat_wall_hits`: the host rejects its hits as `obstructed` |
 | `radar` | `debug.cheat_radar`: the radar saw hidden players (the attack works: H6 is open) |
 | `host_immunity` | `debug.cheat_host_immunity`: the host dropped hits on its player (the attack works: H4 is open) |
+| `forged_scale`, `forged_multiplier`, `forged_kill`, `forged_area` | `debug.cheat_damage`: the host rejects the forged reports for that reason, and no other hit |
 
 ## Joining a game in progress
 

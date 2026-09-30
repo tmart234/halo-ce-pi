@@ -183,6 +183,11 @@ static const struct config_setting config_settings[] =
 		"(debug builds only: a red-team client for tests) debug.network_test_shoot\n"
 		"hits the next player with no line through the level between them, as a\n"
 		"wall-hack client would; the host rejects them (NETCODE.md)." },
+	{ "debug.cheat_damage", _config_string, "\"\"", "HALO_CHEAT_DAMAGE", _environment_value, _platform_all,
+		"(debug builds only: a red-team client for tests) what this client's hit\n"
+		"reports forge: \"scale\" (ten times the damage), \"multiplier\", \"kill\"\n"
+		"(kill instantly) or \"area\" (a bullet as an explosion); the host rejects\n"
+		"them (NETCODE.md). Empty for none." },
 	{ "debug.cheat_radar", _config_boolean, "false", "HALO_CHEAT_RADAR", _environment_set_is_true, _platform_all,
 		"(debug builds only: a red-team client for tests) every second, logs where\n"
 		"each other player is that no line through the level reaches from this\n"
