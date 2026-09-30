@@ -193,9 +193,11 @@ struct peer
 	trust policy) on the session's first packet, and then sends: until
 	then, it is not connected */
 	int session_up;
-	/* a player (on the host): its number in the host's end */
+	/* a player (on the host): its number in the host's end, and the session
+	key it proved (which signs its evidence) */
 	int has_session;
 	uint32_t session;
+	unsigned char session_key[P2P_PUBLIC_KEY_SIZE];
 	unsigned long offered_time;
 	unsigned long heard_time;
 	unsigned long sent_time;
@@ -322,6 +324,41 @@ static unsigned char identifier[P2P_IDENTIFIER_SIZE];
 static int has_identifier;
 /* this machine's session key, whose hash is its identifier */
 static FppSigner *session_key;
+/* hosting: the key its Checkpoints are signed with (p2p_evidence.c), which
+every joiner learns in its session's handshake */
+static FppSigner *instance_key;
+
+void p2p_lock_enter(void)
+{
+	pthread_mutex_lock(&p2p_lock);
+}
+
+void p2p_lock_leave(void)
+{
+	pthread_mutex_unlock(&p2p_lock);
+}
+
+struct FppSigner *p2p_session_key(void)
+{
+	return session_key;
+}
+
+struct FppSigner *p2p_instance_key(void)
+{
+	return instance_key;
+}
+
+void p2p_session_public_key(unsigned char *key)
+{
+	if (!session_key || fpp_signer_public_key(session_key, key) != FPP_STATUS_OK)
+		memset(key, 0, P2P_PUBLIC_KEY_SIZE);
+}
+
+void p2p_instance_public_key(unsigned char *key)
+{
+	if (!instance_key || fpp_signer_public_key(instance_key, key) != FPP_STATUS_OK)
+		memset(key, 0, P2P_PUBLIC_KEY_SIZE);
+}
 
 /* ---------- helpers */
 
@@ -716,6 +753,42 @@ static void peer_send(struct peer *peer, const unsigned char *inner, int size)
 	peer->sent_time = p2p_now();
 }
 
+int p2p_evidence_send(int peer_index, const void *data, int size)
+{
+	struct peer *peer;
+	FppStatus status;
+
+	if (peer_index < 0 || peer_index >= P2P_MAXIMUM_PEERS)
+		return 0;
+	peer = &p2p.peers[peer_index];
+	if (!peer->used || size > FPP_P2P_MAX_MESSAGE)
+		return 0;
+	if (peer->is_host)
+	{
+		if (!peer->joiner)
+			return 0;
+		status = fpp_p2p_joiner_send_reliable(peer->joiner, data, (size_t)size);
+		flush_joiner(peer);
+	}
+	else
+	{
+		if (!peer->has_session || !p2p.host)
+			return 0;
+		status = fpp_p2p_host_send_reliable(p2p.host, peer->session, data, (size_t)size);
+		flush_host();
+	}
+	if (status != FPP_STATUS_OK)
+		platform_log("Internet play: evidence to %s not sent (%s)", peer->name, fpp_status_str((int)status));
+	return status == FPP_STATUS_OK;
+}
+
+int p2p_peer_index_for_address(unsigned long address)
+{
+	struct peer *peer = find_peer_by_address(address);
+
+	return peer && peer->connected ? (int)(peer - p2p.peers) : -1;
+}
+
 static void peer_ping(struct peer *peer)
 {
 	unsigned char inner[5];
@@ -782,6 +855,7 @@ static void peer_end_joiner(struct peer *peer, int tell)
 static void forget_peer(struct peer *peer, const char *reason, int tell)
 {
 	platform_log("Internet play: %s %s: %s", peer->is_host ? "host" : "player", peer->name, reason);
+	p2p_evidence_peer_left((int)(peer - p2p.peers));
 	if (peer->is_host)
 		peer_end_joiner(peer, tell);
 	else if (peer->has_session && p2p.host)
@@ -1084,11 +1158,14 @@ static void host_events(void)
 			}
 			peer->has_session = 1;
 			peer->session = event.peer;
+			memcpy(peer->session_key, event.key, P2P_PUBLIC_KEY_SIZE);
 			peer->connected = 1;
 			peer->heard_time = p2p_now();
 			p2p_hex(joined, P2P_IDENTIFIER_SIZE, name);
 			platform_log("Internet play: connected to player %s (secure session %u)", name,
 				(unsigned int)event.peer);
+			/* (the game's evidence: its name, the first word it hears) */
+			p2p_evidence_peer_admitted((int)(peer - p2p.peers), event.key, event.peer);
 			break;
 		}
 		case FPP_P2P_EVENT_KIND_DATA:
@@ -1096,6 +1173,13 @@ static void host_events(void)
 			{
 				peer->heard_time = p2p_now();
 				session_data(peer, data, (int)event.data_len);
+			}
+			break;
+		case FPP_P2P_EVENT_KIND_MESSAGE:
+			if (peer)
+			{
+				peer->heard_time = p2p_now();
+				p2p_evidence_message((int)(peer - p2p.peers), 0, data, (int)event.data_len);
 			}
 			break;
 		case FPP_P2P_EVENT_KIND_PEER_MIGRATED:
@@ -1114,6 +1198,21 @@ static void host_events(void)
 		}
 	}
 	flush_host();
+}
+
+/* the host sent: it admitted this machine */
+static void joiner_admitted(struct peer *peer)
+{
+	if (peer->connected)
+		return;
+	peer->connected = 1;
+	platform_log("Internet play: connected to host %s (secure session)", peer->name);
+	if (p2p.joining && !memcmp(p2p.join_host, peer->identifier, P2P_IDENTIFIER_SIZE))
+	{
+		p2p.joining = 0;
+		p2p_signal_stop_joining();
+	}
+	platform_log("Internet play: the host's game is listed under Multiplayer, System Link");
 }
 
 /* this machine's end of a session to the host */
@@ -1141,24 +1240,23 @@ static void joiner_events(struct peer *peer)
 			}
 			peer->session_up = 1;
 			peer->heard_time = p2p_now();
+			if (event.has_key)
+				p2p_evidence_host_key((int)(peer - p2p.peers), event.key);
 			platform_log("Internet play: secure session with host %s; waiting to be admitted", peer->name);
 			break;
 		}
 		case FPP_P2P_EVENT_KIND_DATA:
 			peer->heard_time = p2p_now();
 			/* (the host sends only to machines it admitted) */
-			if (!peer->connected)
-			{
-				peer->connected = 1;
-				platform_log("Internet play: connected to host %s (secure session)", peer->name);
-				if (p2p.joining && !memcmp(p2p.join_host, peer->identifier, P2P_IDENTIFIER_SIZE))
-				{
-					p2p.joining = 0;
-					p2p_signal_stop_joining();
-				}
-				platform_log("Internet play: the host's game is listed under Multiplayer, System Link");
-			}
+			joiner_admitted(peer);
 			session_data(peer, data, (int)event.data_len);
+			break;
+		case FPP_P2P_EVENT_KIND_MESSAGE:
+			peer->heard_time = p2p_now();
+			joiner_admitted(peer);
+			p2p_evidence_message((int)(peer - p2p.peers), 1, data, (int)event.data_len);
+			if (!peer->used)
+				return;
 			break;
 		case FPP_P2P_EVENT_KIND_HOST_MIGRATED:
 			platform_log("Internet play: host %s moved to another address", peer->name);
@@ -2263,9 +2361,14 @@ static void update_hosting(void)
 			load_trust_policy();
 			status = fpp_p2p_keypair_generate(p2p.host_private_key, p2p.host_public_key);
 			if (status == FPP_STATUS_OK)
+				status = fpp_signer_generate(&instance_key);
+			if (status == FPP_STATUS_OK)
 			{
-				status = fpp_p2p_host_new(p2p.host_private_key, invite_secret, NULL, hello, sizeof(hello),
-					P2P_MAXIMUM_PEERS, &p2p.host);
+				unsigned char instance_public_key[P2P_PUBLIC_KEY_SIZE];
+
+				p2p_instance_public_key(instance_public_key);
+				status = fpp_p2p_host_new(p2p.host_private_key, invite_secret, instance_public_key, hello,
+					sizeof(hello), P2P_MAXIMUM_PEERS, &p2p.host);
 			}
 			memset(invite_secret, 0, sizeof(invite_secret));
 			if (status != FPP_STATUS_OK)
@@ -2555,6 +2658,22 @@ static void poll_invite_file(void)
 }
 #endif
 
+/* whether this machine has joined a host (then it is not hosting a game of
+its own, whatever its sockets do) */
+static int joined_host(void)
+{
+	int index;
+
+	if (p2p.joining || p2p.join_requested)
+		return 1;
+	for (index = 0; index < P2P_MAXIMUM_PEERS; index++)
+	{
+		if (p2p.peers[index].used && p2p.peers[index].is_host)
+			return 1;
+	}
+	return 0;
+}
+
 /* ---------- the thread */
 
 static void *p2p_thread(void *unused)
@@ -2670,6 +2789,7 @@ static void *p2p_thread(void *unused)
 				stream_update(&p2p.streams[index]);
 		}
 		update_peers();
+		p2p_evidence_update(p2p.hosting && p2p.host && !joined_host());
 		stun_update();
 		update_hosting();
 		update_joining();

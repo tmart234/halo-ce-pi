@@ -203,6 +203,11 @@ static const struct config_setting config_settings[] =
 		"(debug builds only: a red-team client for tests) debug.network_test_shoot\n"
 		"hits the next player with no line through the level between them, as a\n"
 		"wall-hack client would; the host rejects them (NETCODE.md)." },
+	{ "debug.evidence_synthetic", _config_string, "\"\"", "HALO_EVIDENCE_SYNTHETIC", _environment_value, _platform_all,
+		"(for tests) runs internet play's evidence (p2p_evidence.c) without a\n"
+		"game: a joined player sends a made-up hit report each second, which\n"
+		"the host decides; \"on\", or \"omit\" for a host that leaves every other\n"
+		"one out (a cheating host). Empty: the game's own." },
 	{ "debug.cheat_damage", _config_string, "\"\"", "HALO_CHEAT_DAMAGE", _environment_value, _platform_all,
 		"(debug builds only: a red-team client for tests) what this client's hit\n"
 		"reports forge: \"scale\" (ten times the damage), \"multiplier\", \"kill\"\n"

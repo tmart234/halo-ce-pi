@@ -81,6 +81,15 @@ char const *config_string(char const *name);
 #ifndef HALO_RELEASE
 double config_real(char const *name);
 #endif
+/* internet play's evidence (port/linux/src/p2p_evidence.c, stage H4) */
+void p2p_evidence_start_match(int is_host, long tick);
+void p2p_evidence_tick(long tick);
+void p2p_evidence_client_frame(long tick, int units, void const *bytes, int size);
+int p2p_evidence_host_frame(unsigned long address, long tick, int units, void const *bytes, int size);
+/* network_server_message_handler.c's */
+unsigned long network_distributed_machine_address(long machine_index);
+/* network_damage.c's */
+void network_damage_report_origin(unsigned long address, long tick, int unit_offset);
 /* game_engine.c's */
 long game_engine_write_network_state(byte *buffer, long size);
 void game_engine_read_network_state(byte const *buffer, long size);
@@ -625,7 +634,14 @@ void distributed_send(
 	}
 	case _distributed_to_clients_reliably: network_distributed_server_send_to_all_reliably(message, size); break;
 	case _distributed_to_host: distributed_batch_add(HOST_SENDER, message, size); break;
-	case _distributed_to_host_reliably: network_distributed_client_send_reliably(message, size); break;
+	case _distributed_to_host_reliably:
+		/* (what the host must account for: evidence, stage H4; from the
+		message's type on, which the transport leaves as sent) */
+		p2p_evidence_client_frame(game_time_get(),
+			type == _distributed_message_hit_reports ? count : 0,
+			(byte const *)message + sizeof(message_header), (int)(size - sizeof(message_header)));
+		network_distributed_client_send_reliably(message, size);
+		break;
 	}
 }
 
@@ -1840,6 +1856,8 @@ void network_distributed_new_game(
 	distributed_pickup_count = 0;
 	network_objects_new_game();
 	network_damage_new_game();
+	/* (the host names the game for its players' evidence) */
+	p2p_evidence_start_match(game_connection() == _game_connection_network_server, game_time_get());
 }
 
 /* after each tick (game_time.c) */
@@ -1851,6 +1869,7 @@ void network_distributed_tick(
 	if (!network_game_distributed() || game_time_get() == distributed_last_sent_time)
 		return;
 	distributed_last_sent_time = game_time_get();
+	p2p_evidence_tick(game_time_get());
 	if (connection == _game_connection_network_server)
 	{
 		/* the clients' players where they say they are, then the objects
@@ -2049,8 +2068,18 @@ void network_distributed_handle_message(
 		network_damage_handle_events(entries, header.count);
 		break;
 	case _distributed_message_hit_reports:
+	{
+		/* (what the player signed it sent, for the host's evidence: every
+		report's outcome, stage H4) */
+		unsigned long address = network_distributed_machine_address(machine_index);
+		int offset = p2p_evidence_host_frame(address, header.game_time, header.count,
+			(byte const *)message + sizeof(message_header), (int)(size - sizeof(message_header)));
+
+		network_damage_report_origin(address, header.game_time, offset);
 		network_damage_handle_reports(machine_index, entries, header.count);
+		network_damage_report_origin(0, NONE, 0);
 		break;
+	}
 	case _distributed_message_vehicle_prediction:
 		network_objects_handle_vehicle_prediction(machine_index, entries, header.count);
 		break;
