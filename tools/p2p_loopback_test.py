@@ -8,6 +8,11 @@ Passes when the joiner and the host log a secure session, keep it, and a
 third copy whose invite has another host key (an impostor's, or a forged
 signalling answer) reaches the host's address but gets no session.
 
+--evidence tests the host's evidence (stage H4) instead: synthetic hit
+reports (debug.evidence_synthetic) from a joined player, audited with the
+SDK's auditor (crates/fpp-audit): an honest host's evidence is clean, and a
+host that leaves out outcomes is caught from the player's bundle.
+
 --trust tests the host's trust policy instead (network.minimum_tier 2): a
 joiner with a D2 Attestation Result bound to its session key is admitted;
 one with a D1 result, one with none, and one presenting the first's result
@@ -130,12 +135,77 @@ def trust_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
     return failures
 
 
+def audit(bundles: List[Path]) -> subprocess.CompletedProcess:
+    """the SDK's evidence auditor (crates/fpp-audit), on bundles"""
+    return subprocess.run(["cargo", "run", "-q", "--release", "--locked", "-p", "fpp-audit", "--",
+                           *(str(b.resolve()) for b in bundles)],
+                          cwd=mmo_checkout(), capture_output=True, text=True)
+
+
+def evidence_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
+    """the host's evidence (stage H4), without a game: an honest host's
+    evidence audits clean; a cheating host's (debug.evidence_synthetic
+    omit: every other hit report left without an outcome) is caught from its
+    player's bundle"""
+    failures = []
+    for mode, honest in (("on", True), ("omit", False)):
+        base = work / mode
+        env = {**common, "HALO_EVIDENCE_SYNTHETIC": mode}
+        processes = []
+        try:
+            processes.append(start(args.binary, base / "host", {**env, "HALO_NET_ADDRESS": "127.0.0.200",
+                                                                "HALO_NETWORK_TEST": "host:bloodgulch"}, []))
+            invite = wait_for(base / "host" / "stdout.txt", INVITE.pattern, 20)
+            if not invite:
+                failures.append(f"{mode}: the host made no invite")
+                continue
+            processes.append(start(args.binary, base / "joiner", {**env, "HALO_NET_ADDRESS": "127.0.0.201",
+                                                                  "HALO_NETWORK_TEST": "join"}, [invite.group(0)]))
+            if not wait_for(base / "joiner" / "stdout.txt", r"evidence goes to", 30):
+                failures.append(f"{mode}: the player never started its evidence")
+                continue
+            # (three epochs of five seconds, and the Checkpoints' grace)
+            time.sleep(20)
+        finally:
+            for process in processes:
+                process.terminate()
+            for process in processes:
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        bundles = sorted(base.glob("*/evidence/*.fppb"))
+        players = [b for b in bundles if "-player-" in b.name]
+        if len(players) != 1 or len(bundles) != 2:
+            failures.append(f"{mode}: expected a host and a player bundle, found {[b.name for b in bundles]}")
+            continue
+        result = audit(bundles)
+        print(result.stdout.rstrip())
+        if result.returncode not in (0, 1):
+            failures.append(f"{mode}: the auditor failed: {result.stderr.strip()}")
+            continue
+        checkpoints = re.search(r"-player-.*?(\d+) checkpoints, (\d+) outcomes", result.stdout)
+        if not checkpoints or int(checkpoints.group(1)) < 2 or int(checkpoints.group(2)) < 2:
+            failures.append(f"{mode}: the player's bundle holds too little to audit")
+        caught = "no outcome for unit" in result.stdout
+        if honest and (result.returncode != 0 or caught):
+            failures.append("the honest host's evidence did not audit clean")
+        if not honest and (result.returncode != 1 or not caught):
+            failures.append("the cheating host was not caught")
+        print(f"{'ok  ' if not failures else 'FAIL'} {mode}: "
+              f"{'clean' if result.returncode == 0 else 'findings'}{' (dropped outcomes caught)' if caught else ''}")
+    return failures
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", type=Path, default=Path("build/linux/halo"))
     parser.add_argument("--work", type=Path, default=None)
     parser.add_argument("--seconds", type=float, default=40.0)
     parser.add_argument("--trust", action="store_true", help="test the host's trust policy instead")
+    parser.add_argument("--synthetic", default="", help="(development) debug.evidence_synthetic for both copies")
+    parser.add_argument("--evidence", action="store_true",
+                        help="test the host's evidence and its audit instead (needs Rust: fpp-audit)")
     args = parser.parse_args(argv)
 
     work = args.work or Path(tempfile.mkdtemp(prefix="p2p_loopback_"))
@@ -152,8 +222,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # (not over the LAN: the copies see each other only through the tunnel)
         "HALO_NET_BROADCAST": "127.0.0.254",
     }
-    if args.trust:
-        failures = trust_test(args, work, common)
+    if args.synthetic:
+        common["HALO_EVIDENCE_SYNTHETIC"] = args.synthetic
+    if args.trust or args.evidence:
+        failures = trust_test(args, work, common) if args.trust else evidence_test(args, work, common)
         print(f"logs: {work}")
         for failure in failures:
             print(f"FAIL: {failure}")

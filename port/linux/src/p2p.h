@@ -50,4 +50,17 @@ void p2p_socket_closed(int socket);
 from the main thread */
 const char *p2p_take_clipboard_text(void);
 
+/* evidence of an internet play game (p2p_evidence.c, stage H4), from the
+game's thread; the ticks are the game's. A game starts (the host names it
+for its players); each tick; a player's message to the host on the reliable
+channel, with the count of units (hit reports) the host must account for;
+the host's receipt of one from the machine at address (network byte order),
+which returns the offset of its first unit in the tick's frame; and the
+host's decision on a unit (applied, or rejected with a reason code) */
+void p2p_evidence_start_match(int is_host, long tick);
+void p2p_evidence_tick(long tick);
+void p2p_evidence_client_frame(long tick, int units, const void *bytes, int size);
+int p2p_evidence_host_frame(unsigned long address, long tick, int units, const void *bytes, int size);
+void p2p_evidence_host_outcome(unsigned long address, long tick, int unit, int applied, int reason);
+
 #endif

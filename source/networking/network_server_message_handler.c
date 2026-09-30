@@ -744,6 +744,43 @@ short network_distributed_server_machines(
 	return count;
 }
 
+/* the address of a machine in the game (IPv4, network byte order), 0 for
+none: the peer internet play knows it as (port/linux/src/p2p_evidence.c) */
+unsigned long network_distributed_machine_address(
+	long machine_index)
+{
+	struct network_game_server *server = global_network_game_server_get();
+	long client_index;
+
+	if (!server)
+		return 0;
+	for (client_index = 0; client_index < MAXIMUM_NETWORK_MACHINE_COUNT; client_index++)
+	{
+		struct network_game_server_client_machine *machine =
+			network_game_server_get_client_machine_at_index(server, client_index);
+		struct network_connection *connection;
+		struct transport_address address;
+		long game_machine_index;
+
+		if (!network_game_server_client_machine_is_joined_to_game(server, machine))
+			continue;
+		network_game_server_get_client_machine(server, machine, &game_machine_index);
+		if (game_machine_index != machine_index)
+			continue;
+		connection = network_game_server_get_client_connection(machine);
+		if (!connection)
+			return 0;
+		network_connection_get_address(connection, &address, NULL);
+		/* (the transport's is in the host's byte order) */
+		{
+			unsigned long value = address.address.long_words[0];
+
+			return (value >> 24) | ((value >> 8) & 0xFF00) | ((value << 8) & 0xFF0000) | (value << 24);
+		}
+	}
+	return 0;
+}
+
 /* the distributed netcode's per-tick state (port/linux/game/network_distributed.c),
 unreliably (a lost one is overtaken by the next) to one machine in the game */
 boolean network_distributed_server_send_to_machine(
