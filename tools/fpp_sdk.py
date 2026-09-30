@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "https://github.com/tmart234/mmo.git"
 # the mmo commit whose crates/fpp-ffi this port uses (and whose fpp.h is
 # vendored); raise it with the header
-COMMIT = "8310acb813c49202f1fe92c01282489655ac2d00"
+COMMIT = "d520f3bd956ba254ff2c543187ed8d1c07621dc2"
 HEADER = ROOT / "port/third_party/fpp/include/fpp.h"
 INCLUDE = HEADER.parent
 THIRD_PARTY = ROOT / "build/third_party"
