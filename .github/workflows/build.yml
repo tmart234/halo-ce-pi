@@ -87,6 +87,11 @@ jobs:
       - name: Internet play
         run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo
 
+      # a host's trust policy (network.minimum_tier): a D2 device admitted;
+      # D1, none, and a stolen Attestation Result refused
+      - name: Trusted games
+        run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo --trust
+
       - name: Compile cache
         run: ccache --show-stats
 

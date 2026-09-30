@@ -27,6 +27,33 @@ enum FppStatus fpp_signer_public_key(const struct FppSigner *signer, uint8_t *ou
 	return FPP_STATUS_INTERNAL;
 }
 
+enum FppStatus fpp_signer_from_seed(const uint8_t *seed, struct FppSigner **out)
+{
+	(void)seed;
+	*out = NULL;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_ar_verify(const uint8_t *ar, size_t len, const uint8_t *verifier_keys, size_t verifier_key_count,
+	const uint8_t *session_public_key, uint64_t now_s, uint8_t minimum_tier, struct FppArInfo *info)
+{
+	(void)ar;
+	(void)len;
+	(void)verifier_keys;
+	(void)verifier_key_count;
+	(void)session_public_key;
+	(void)now_s;
+	(void)minimum_tier;
+	(void)info;
+	return FPP_STATUS_INTERNAL;
+}
+
+const char *fpp_status_str(int status)
+{
+	(void)status;
+	return "no SDK in this build";
+}
+
 void fpp_signer_free(struct FppSigner *signer)
 {
 	(void)signer;
