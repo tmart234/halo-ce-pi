@@ -691,6 +691,8 @@ static void host_checkpoint(long epoch)
 	}
 	fpp_checkpoint_free(builder);
 	evidence.has_prev_checkpoint = 1;
+	/* (a verified game's logged chain anchors it: p2p_verified.c) */
+	p2p_verified_anchor(evidence.prev_checkpoint);
 	put_u32(package, (unsigned long)object_size);
 	package_size = 4 + (int)object_size;
 	put_u16(package + package_size, (unsigned long)leaf_count);

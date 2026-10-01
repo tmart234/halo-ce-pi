@@ -51,6 +51,10 @@ link games as if they were on one LAN, without a server of this project's.
   game's broadcasts also go to every peer, so a host's game shows up in its
   joiners' system link lists, and joining works as on a LAN.
 
+- A verified playlist's host and players (p2p_verified.c) use the same
+  tunnel without invites or signalling: the host is blessed by a region's
+  Server Liveness, and players dial it with a place its Broker gave them.
+
 The work happens on a thread of its own, under p2p_lock; the game's
 threads only look up and create stand-ins.
 */
@@ -202,6 +206,10 @@ struct peer
 	unsigned long heard_time;
 	unsigned long sent_time;
 	unsigned long round_trip;
+	/* the host of a verified game (network.ticket_file): dialled at the
+	ticket's address, with no invite or signalling; its identifier is the
+	one its session's hello names */
+	int direct;
 };
 
 /* a UDP stand-in for one port of a peer */
@@ -581,9 +589,11 @@ const unsigned char *p2p_identifier(void)
 		const char *seed_file = config_string("network.session_key_file");
 		FppStatus status;
 
-		/* a new session key each run (or network.session_key_file's), and
-		the identifier its hash */
-		if (seed_file[0] && read_key_file(seed_file, seed))
+		/* a new session key each run (or a verified game's ticket's, or
+		network.session_key_file's), and the identifier its hash */
+		if (p2p_verified_ticket_seed(seed))
+			status = fpp_signer_from_seed(seed, &session_key);
+		else if (seed_file[0] && read_key_file(seed_file, seed))
 			status = fpp_signer_from_seed(seed, &session_key);
 		else
 			status = fpp_signer_generate(&session_key);
@@ -782,6 +792,65 @@ int p2p_evidence_send(int peer_index, const void *data, int size)
 	return status == FPP_STATUS_OK;
 }
 
+static void joiner_admitted(struct peer *peer);
+static void forget_peer(struct peer *peer, const char *reason, int tell);
+
+void p2p_peer_admit(int peer_index)
+{
+	struct peer *peer;
+
+	if (peer_index < 0 || peer_index >= P2P_MAXIMUM_PEERS || !p2p.peers[peer_index].used)
+		return;
+	peer = &p2p.peers[peer_index];
+	if (peer->is_host)
+	{
+		joiner_admitted(peer);
+		return;
+	}
+	if (peer->connected || !peer->has_session)
+		return;
+	peer->connected = 1;
+	peer->heard_time = p2p_now();
+	platform_log("Internet play: connected to player %s (secure session %u, admitted)", peer->name,
+		(unsigned int)peer->session);
+	p2p_evidence_peer_admitted(peer_index, peer->session_key, peer->session);
+}
+
+void p2p_peer_refuse(int peer_index, unsigned short reason)
+{
+	struct peer *peer;
+
+	if (peer_index < 0 || peer_index >= P2P_MAXIMUM_PEERS || !p2p.peers[peer_index].used)
+		return;
+	peer = &p2p.peers[peer_index];
+	if (peer->is_host)
+	{
+		forget_peer(peer, "left it (verified play)", 1);
+		return;
+	}
+	if (peer->has_session && p2p.host)
+	{
+		/* (what was queued for it, Reject or Kick, goes first) */
+		fpp_p2p_host_tick(p2p.host, session_now());
+		flush_host();
+		fpp_p2p_host_disconnect(p2p.host, peer->session, reason);
+		flush_host();
+		peer->has_session = 0;
+	}
+	forget_peer(peer, "refused (verified play)", 0);
+}
+
+int p2p_peer_session_key(int peer_index, unsigned char *key, size_t *size)
+{
+	struct peer *peer;
+
+	if (peer_index < 0 || peer_index >= P2P_MAXIMUM_PEERS || !p2p.peers[peer_index].used)
+		return 0;
+	peer = &p2p.peers[peer_index];
+	return !peer->is_host && peer->has_session && p2p.host &&
+		fpp_p2p_host_peer_session_key(p2p.host, peer->session, key, size) == FPP_STATUS_OK;
+}
+
 int p2p_peer_index_for_address(unsigned long address)
 {
 	struct peer *peer = find_peer_by_address(address);
@@ -856,6 +925,10 @@ static void forget_peer(struct peer *peer, const char *reason, int tell)
 {
 	platform_log("Internet play: %s %s: %s", peer->is_host ? "host" : "player", peer->name, reason);
 	p2p_evidence_peer_left((int)(peer - p2p.peers));
+	if (peer->is_host)
+		p2p_verified_joiner_gone((int)(peer - p2p.peers));
+	else
+		p2p_verified_host_left((int)(peer - p2p.peers));
 	if (peer->is_host)
 		peer_end_joiner(peer, tell);
 	else if (peer->has_session && p2p.host)
@@ -956,6 +1029,56 @@ void p2p_peer_offered(const unsigned char *peer_identifier, const struct p2p_can
 	add_candidates(peer, candidates, count);
 }
 
+/* this machine's end of a session to the host, at address: the invite's
+key and secret (a verified game's: its ticket's key, no secret, and the
+Attestation Result in its admission instead) */
+static void start_joiner(struct peer *peer, const struct p2p_candidate *address)
+{
+	char text[32];
+	unsigned char host_address[SESSION_ADDRESS_SIZE];
+	unsigned char hello[SESSION_HELLO_SIZE];
+	FppStatus status;
+
+	put_session_address(host_address, address);
+	hello[0] = SESSION_HELLO_VERSION;
+	memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
+	peer_end_joiner(peer, 0);
+	if (peer->direct)
+	{
+		status = fpp_p2p_joiner_new(peer->host_public_key, NULL, session_key, NULL, 0, hello, sizeof(hello),
+			host_address, sizeof(host_address), &peer->joiner);
+		p2p_verified_joiner_started((int)(peer - p2p.peers));
+	}
+	else
+	{
+		/* this device's Attestation Result, for a host with a trust
+		policy (none: D0) */
+		unsigned char attestation[FPP_P2P_MAX_ATTESTATION];
+		const char *path = config_string("network.attestation_file");
+		int attestation_size = path[0] ? read_file_bytes(path, attestation, (int)sizeof(attestation)) : 0;
+
+		if (attestation_size < 0)
+		{
+			platform_log("Internet play: cannot read network.attestation_file %s (at most %d bytes); "
+				"joining without it", path, (int)sizeof(attestation));
+			attestation_size = 0;
+		}
+		status = fpp_p2p_joiner_new(peer->host_public_key, peer->invite_secret, session_key,
+			attestation_size ? attestation : NULL, (size_t)attestation_size, hello, sizeof(hello),
+			host_address, sizeof(host_address), &peer->joiner);
+	}
+	if (status != FPP_STATUS_OK)
+	{
+		platform_log("Internet play: cannot start a session with host %s (%d)", peer->name, (int)status);
+		peer->joiner = NULL;
+		peer->has_endpoint = 0;
+		return;
+	}
+	platform_log("Internet play: host %s answers at %s; starting a secure session", peer->name,
+		address_text(address->address, address->port, text));
+	flush_joiner(peer);
+}
+
 /* a probe: a ping answered with a pong to where it came from; a pong from
 the host, to this machine's ping, is where to start its session */
 static void probe_received(const unsigned char *probe, int size, const struct sockaddr_in *from)
@@ -976,46 +1099,11 @@ static void probe_received(const unsigned char *probe, int size, const struct so
 	else if (probe[1] == _probe_pong && peer->is_host && !peer->has_endpoint && !peer->connected &&
 		!memcmp(probe + 2 + P2P_IDENTIFIER_SIZE, peer->probe_nonce, PROBE_NONCE_SIZE))
 	{
-		char text[32];
-		unsigned char host_address[SESSION_ADDRESS_SIZE];
-		unsigned char hello[SESSION_HELLO_SIZE];
-		FppStatus status;
-
 		peer->has_endpoint = 1;
 		peer->endpoint = address;
 		peer->endpoint_time = p2p_now();
 		peer->retry_time = p2p_now();
-		put_session_address(host_address, &address);
-		hello[0] = SESSION_HELLO_VERSION;
-		memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
-		peer_end_joiner(peer, 0);
-		{
-			/* this device's Attestation Result, for a host with a trust
-			policy (none: D0) */
-			unsigned char attestation[FPP_P2P_MAX_ATTESTATION];
-			const char *path = config_string("network.attestation_file");
-			int attestation_size = path[0] ? read_file_bytes(path, attestation, (int)sizeof(attestation)) : 0;
-
-			if (attestation_size < 0)
-			{
-				platform_log("Internet play: cannot read network.attestation_file %s (at most %d bytes); "
-					"joining without it", path, (int)sizeof(attestation));
-				attestation_size = 0;
-			}
-			status = fpp_p2p_joiner_new(peer->host_public_key, peer->invite_secret, session_key,
-				attestation_size ? attestation : NULL, (size_t)attestation_size, hello, sizeof(hello),
-				host_address, sizeof(host_address), &peer->joiner);
-		}
-		if (status != FPP_STATUS_OK)
-		{
-			platform_log("Internet play: cannot start a session with host %s (%d)", peer->name, (int)status);
-			peer->joiner = NULL;
-			peer->has_endpoint = 0;
-			return;
-		}
-		platform_log("Internet play: host %s answers at %s; starting a secure session", peer->name,
-			address_text(address.address, address.port, text));
-		flush_joiner(peer);
+		start_joiner(peer, &address);
 	}
 }
 
@@ -1068,6 +1156,12 @@ static int admits(const unsigned char *joined, const unsigned char *attestation,
 	p2p.last_refusal_tier = 0;
 	if (!attestation_size)
 	{
+		if (p2p.minimum_tier <= 0 && p2p_verified_builds_listed())
+		{
+			platform_log("Internet play: refused player %s: no attestation to say its client build "
+				"(network.client_builds)", name);
+			return 0;
+		}
 		if (p2p.minimum_tier <= 0)
 			return 1;
 		p2p.last_refusal_tier = 1;
@@ -1078,13 +1172,28 @@ static int admits(const unsigned char *joined, const unsigned char *attestation,
 	if (!p2p.verifier_key_count)
 	{
 		/* (a result nobody here can check counts for nothing: D0) */
-		if (p2p.minimum_tier <= 0)
+		if (p2p.minimum_tier <= 0 && !p2p_verified_builds_listed())
 			return 1;
 		platform_log("Internet play: refused player %s: no network.verifier_keys to check its attestation", name);
 		return 0;
 	}
 	status = fpp_ar_verify(attestation, attestation_size, &p2p.verifier_keys[0][0], (size_t)p2p.verifier_key_count,
 		key, (uint64_t)time(NULL), (uint8_t)(p2p.minimum_tier > 0 ? p2p.minimum_tier : 0), &info);
+	/* the title's own lists (p2p_verified.c), on what the result says: a
+	banned device (finding H08: the Device ID is the Verifier's, from the
+	hardware where the device has a key in it), a client build it does not
+	list (H07: measured where the platform measures it) */
+	if ((status == FPP_STATUS_OK || status == FPP_STATUS_TOKEN_TIER) && p2p_verified_device_banned(info.did))
+	{
+		platform_log("Internet play: refused player %s: its device is banned (network.banned_devices)", name);
+		return 0;
+	}
+	if (status == FPP_STATUS_OK && !p2p_verified_build_admitted(info.client_build))
+	{
+		platform_log("Internet play: refused player %s: its client build is not one network.client_builds lists",
+			name);
+		return 0;
+	}
 	if (status == FPP_STATUS_OK)
 	{
 		platform_log("Internet play: player %s is a D%d %s device", name, (int)info.tier, (const char *)info.platform);
@@ -1098,7 +1207,7 @@ static int admits(const unsigned char *joined, const unsigned char *attestation,
 		return 0;
 	}
 	/* (an untrusted game takes anyone: a bad result only makes it D0) */
-	if (p2p.minimum_tier <= 0)
+	if (p2p.minimum_tier <= 0 && !p2p_verified_builds_listed())
 		return 1;
 	platform_log("Internet play: refused player %s: its attestation does not verify (%s)", name,
 		fpp_status_str((int)status));
@@ -1130,7 +1239,7 @@ static void host_events(void)
 				fpp_p2p_host_disconnect(p2p.host, event.peer, SESSION_REASON_REFUSED);
 				break;
 			}
-			if (!admits(joined, data, event.attestation_len, event.key))
+			if (!p2p_verified_hosting() && !admits(joined, data, event.attestation_len, event.key))
 			{
 				fpp_p2p_host_disconnect(p2p.host, event.peer,
 					p2p.last_refusal_tier ? SESSION_REASON_TIER : SESSION_REASON_ATTESTATION);
@@ -1159,9 +1268,19 @@ static void host_events(void)
 			peer->has_session = 1;
 			peer->session = event.peer;
 			memcpy(peer->session_key, event.key, P2P_PUBLIC_KEY_SIZE);
-			peer->connected = 1;
 			peer->heard_time = p2p_now();
 			p2p_hex(joined, P2P_IDENTIFIER_SIZE, name);
+			if (p2p_verified_hosting())
+			{
+				/* a verified game: the player is sent the SAR, and the game
+				sees it once its admission checks out */
+				peer->connected = 0;
+				platform_log("Internet play: secure session %u with player %s; waiting for its admission",
+					(unsigned int)event.peer, name);
+				p2p_verified_host_joined((int)(peer - p2p.peers));
+				break;
+			}
+			peer->connected = 1;
 			platform_log("Internet play: connected to player %s (secure session %u)", name,
 				(unsigned int)event.peer);
 			/* (the game's evidence: its name, the first word it hears) */
@@ -1172,14 +1291,20 @@ static void host_events(void)
 			if (peer)
 			{
 				peer->heard_time = p2p_now();
-				session_data(peer, data, (int)event.data_len);
+				/* (a verified game's player: nothing before its admission) */
+				if (peer->connected)
+					session_data(peer, data, (int)event.data_len);
 			}
 			break;
 		case FPP_P2P_EVENT_KIND_MESSAGE:
 			if (peer)
 			{
 				peer->heard_time = p2p_now();
-				p2p_evidence_message((int)(peer - p2p.peers), 0, data, (int)event.data_len);
+				if (!p2p_verified_host_message((int)(peer - p2p.peers), data, (int)event.data_len) &&
+					peer->connected)
+				{
+					p2p_evidence_message((int)(peer - p2p.peers), 0, data, (int)event.data_len);
+				}
 			}
 			break;
 		case FPP_P2P_EVENT_KIND_PEER_MIGRATED:
@@ -1233,26 +1358,51 @@ static void joiner_events(struct peer *peer)
 			/* (the key was the invite's, which the handshake proved; the
 			hello must name the same machine) */
 			if (!hello_matches(data, event.data_len, NULL, host) ||
-				memcmp(host, peer->identifier, P2P_IDENTIFIER_SIZE))
+				(!peer->direct && memcmp(host, peer->identifier, P2P_IDENTIFIER_SIZE)))
 			{
 				drop_peer(peer, "its session named another machine");
 				return;
+			}
+			if (peer->direct && memcmp(host, peer->identifier, P2P_IDENTIFIER_SIZE))
+			{
+				/* a verified game's host: the ticket named its key (which
+				the handshake proved), and its hello names it */
+				if (find_peer(host))
+				{
+					drop_peer(peer, "its session named a machine already here");
+					return;
+				}
+				memcpy(peer->identifier, host, P2P_IDENTIFIER_SIZE);
+				p2p_hex(host, P2P_IDENTIFIER_SIZE, peer->name);
+				peer->virtual_address = 0;
+				peer->virtual_address = virtual_address_for(host);
 			}
 			peer->session_up = 1;
 			peer->heard_time = p2p_now();
 			if (event.has_key)
 				p2p_evidence_host_key((int)(peer - p2p.peers), event.key);
+			if (peer->direct)
+				p2p_verified_joiner_connected((int)(peer - p2p.peers), event.has_key ? event.key : NULL);
 			platform_log("Internet play: secure session with host %s; waiting to be admitted", peer->name);
 			break;
 		}
 		case FPP_P2P_EVENT_KIND_DATA:
 			peer->heard_time = p2p_now();
-			/* (the host sends only to machines it admitted) */
+			/* (the host sends only to machines it admitted; a verified
+			game's says so first) */
+			if (!p2p_verified_joiner_admitted((int)(peer - p2p.peers)))
+				break;
 			joiner_admitted(peer);
 			session_data(peer, data, (int)event.data_len);
 			break;
 		case FPP_P2P_EVENT_KIND_MESSAGE:
 			peer->heard_time = p2p_now();
+			if (p2p_verified_joiner_message((int)(peer - p2p.peers), data, (int)event.data_len))
+			{
+				if (!peer->used)
+					return;
+				break;
+			}
 			joiner_admitted(peer);
 			p2p_evidence_message((int)(peer - p2p.peers), 1, data, (int)event.data_len);
 			if (!peer->used)
@@ -1299,6 +1449,10 @@ static void update_peers(void)
 			joiner_events(peer);
 			if (!peer->used)
 				continue;
+			/* (a verified game's host must stay blessed) */
+			p2p_verified_joiner_update(index);
+			if (!peer->used)
+				continue;
 		}
 		if (peer->connected)
 		{
@@ -1324,11 +1478,28 @@ static void update_peers(void)
 				flush_joiner(peer);
 				peer->retry_time = p2p_now();
 			}
-			if (peer->has_endpoint && elapsed(peer->endpoint_time, HANDSHAKE_TIMEOUT))
+			/* (a verified game's host whose session is up is waited on by its
+			SARs instead: p2p_verified.c; a new session would spend the
+			Broker's place, which is good once) */
+			if (peer->has_endpoint && elapsed(peer->endpoint_time, HANDSHAKE_TIMEOUT) &&
+				!(peer->direct && peer->session_up))
 			{
 				peer_end_joiner(peer, 0);
 				peer->has_endpoint = 0;
 				peer->session_up = 0;
+			}
+			/* a verified game's host is where its ticket says: no probing */
+			if (peer->direct)
+			{
+				if (!peer->has_endpoint && peer->candidate_count)
+				{
+					peer->has_endpoint = 1;
+					peer->endpoint = peer->candidates[0];
+					peer->endpoint_time = p2p_now();
+					peer->retry_time = p2p_now();
+					start_joiner(peer, &peer->endpoint);
+				}
+				continue;
 			}
 			/* probes to every address offered, which open both NATs; a
 			joiner's, with a fresh nonce, until the host answers one */
@@ -2267,6 +2438,32 @@ void p2p_invite_received(const char *text)
 		platform_log("Internet play: that is not an invite");
 }
 
+/* a verified game's player (network.ticket_file): the ticket's host,
+dialled at its address, once; the Broker's place in its match is used once */
+static void update_ticket(void)
+{
+	static int started;
+	struct p2p_candidate address;
+	unsigned char host_key[P2P_PUBLIC_KEY_SIZE];
+	unsigned char placeholder[P2P_IDENTIFIER_SIZE];
+	struct peer *peer;
+	char text[32];
+
+	if (started || !p2p_verified_ticket_host(&address, host_key))
+		return;
+	started = 1;
+	/* (named after its key until its session's hello names it) */
+	identifier_from_key(host_key, placeholder);
+	peer = new_peer(placeholder, 1);
+	if (!peer)
+		return;
+	peer->direct = 1;
+	memcpy(peer->host_public_key, host_key, P2P_PUBLIC_KEY_SIZE);
+	add_candidates(peer, &address, 1);
+	platform_log("Verified play: joining the host the Broker placed this machine with, at %s",
+		address_text(address.address, address.port, text));
+}
+
 static void update_joining(void)
 {
 	char name[2 * P2P_IDENTIFIER_SIZE + 1];
@@ -2300,6 +2497,18 @@ static int connected_player_count(void)
 
 	for (index = 0; index < P2P_MAXIMUM_PEERS; index++)
 		count += p2p.peers[index].used && p2p.peers[index].connected && !p2p.peers[index].is_host;
+	return count;
+}
+
+int p2p_player_count(void)
+{
+	int count;
+
+	if (!p2p.running)
+		return 0;
+	pthread_mutex_lock(&p2p_lock);
+	count = connected_player_count();
+	pthread_mutex_unlock(&p2p_lock);
 	return count;
 }
 
@@ -2367,8 +2576,10 @@ static void update_hosting(void)
 				unsigned char instance_public_key[P2P_PUBLIC_KEY_SIZE];
 
 				p2p_instance_public_key(instance_public_key);
-				status = fpp_p2p_host_new(p2p.host_private_key, invite_secret, instance_public_key, hello,
-					sizeof(hello), P2P_MAXIMUM_PEERS, &p2p.host);
+				/* (a verified game's players come with no invite, matched by
+				the region's Broker) */
+				status = fpp_p2p_host_new(p2p.host_private_key, p2p_verified_hosting() ? NULL : invite_secret,
+					instance_public_key, hello, sizeof(hello), P2P_MAXIMUM_PEERS, &p2p.host);
 			}
 			memset(invite_secret, 0, sizeof(invite_secret));
 			if (status != FPP_STATUS_OK)
@@ -2385,6 +2596,22 @@ static void update_hosting(void)
 			snprintf(p2p.invite, sizeof(p2p.invite), "halo://join/%s", text);
 		}
 		p2p.hosting = 1;
+		if (p2p_verified_hosting())
+		{
+			/* a verified game: blessed by Server Liveness at the address
+			players dial (network.game_address: this machine's, at
+			network.tunnel_port, by default) */
+			char address[64];
+			const char *configured = config_string("network.game_address");
+
+			if (configured[0])
+				snprintf(address, sizeof(address), "%s", configured);
+			else
+				address_text(p2p.local_address, p2p.tunnel_port, address);
+			p2p_verified_host_start(p2p.host_public_key, address);
+			p2p.reported_peer_count = -1;
+			return;
+		}
 		p2p.stun_started = 1;
 		p2p_signal_start();
 		p2p_signal_host(p2p.token);
@@ -2404,6 +2631,8 @@ static void update_hosting(void)
 		p2p_signal_stop_hosting();
 		p2p_discord_set_hosting(NULL, 0, 0);
 	}
+	if (p2p.hosting && p2p_verified_hosting())
+		return;
 	if (p2p.hosting && p2p.reported_peer_count != connected_player_count())
 	{
 		p2p.reported_peer_count = connected_player_count();
@@ -2792,6 +3021,8 @@ static void *p2p_thread(void *unused)
 		p2p_evidence_update(p2p.hosting && p2p.host && !joined_host());
 		stun_update();
 		update_hosting();
+		p2p_verified_host_update();
+		update_ticket();
 		update_joining();
 		update_upnp();
 		p2p_discord_update();

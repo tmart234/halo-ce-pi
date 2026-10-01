@@ -52,7 +52,7 @@ jobs:
         run: |
           printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
           pacman -Syu --noconfirm --needed git zstd python python-pytest ninja ccache \
-            clang lld gcc lib32-glibc lib32-gcc-libs lib32-sdl3 rustup
+            clang lld gcc lib32-glibc lib32-gcc-libs lib32-sdl3 rustup cmake
           # internet play's secure sessions: the fpp SDK (tools/fpp_sdk.py)
           rustup default stable
           rustup target add i686-unknown-linux-gnu
@@ -99,6 +99,13 @@ jobs:
       # clean; one that leaves out hit reports' outcomes is caught
       - name: Evidence
         run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo --evidence
+
+      # a verified playlist (stage H5): a dev cell of the region's services
+      # (the SDK's mmo checkout), a host blessed by its Server Liveness, a
+      # player matched by its Broker admitted, one with another build
+      # refused, and the player gone once the host is no longer blessed
+      - name: Verified playlists
+        run: python tools/p2p_loopback_test.py --binary dist/halo-linux-debug/halo --verified
 
       - name: Compile cache
         run: ccache --show-stats

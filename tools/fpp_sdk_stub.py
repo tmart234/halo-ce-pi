@@ -36,8 +36,15 @@ run it after using another SDK call.
 """
 
 
+def without_gs_link(text):
+    """the header without its FPP_GS_LINK parts (a dedicated host's link to
+    Server Liveness, which only the Linux build has, and calls only under
+    #ifdef FPP_GS_LINK): they have no stand-in"""
+    return re.sub(r"^#if defined\(FPP_GS_LINK\)\n.*?^#endif\n", "", text, flags=re.M | re.S)
+
+
 def prototypes():
-    text = HEADER.read_text()
+    text = without_gs_link(HEADER.read_text())
     # (a prototype: a return type, fpp_name, the parameters, a semicolon)
     pattern = re.compile(r"^((?:enum FppStatus|void|const char \*|uint32_t))\s*(fpp_\w+)\(([^;]*?)\);", re.M | re.S)
     return {m.group(2): (m.group(1).strip(), " ".join(m.group(3).split())) for m in pattern.finditer(text)}
@@ -48,7 +55,9 @@ def used():
     for source in SOURCES:
         if source == STUB:
             continue
-        names.update(re.findall(r"\b(fpp_[a-z0-9_]+)\s*\(", source.read_text()))
+        # (calls under #ifdef FPP_GS_LINK: the Linux build's alone)
+        text = re.sub(r"^#ifdef FPP_GS_LINK\n.*?^#endif[^\n]*\n", "", source.read_text(), flags=re.M | re.S)
+        names.update(re.findall(r"\b(fpp_[a-z0-9_]+)\s*\(", text))
     return names
 
 

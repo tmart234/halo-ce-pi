@@ -556,12 +556,20 @@ static void network_test_pickup(
 	}
 }
 
+void network_dedicated_update(boolean main_menu_loaded, real seconds);
+boolean network_dedicated_enabled(void);
+
 void network_test_update(
 	boolean main_menu_loaded,
 	real seconds)
 {
+	/* (a dedicated host: network_dedicated.c, which the network test's
+	host does not run beside) */
+	network_dedicated_update(main_menu_loaded, seconds);
 	if (!network_test.checked)
 		network_test_read_settings();
+	if (network_test.mode == _network_test_host && network_dedicated_enabled())
+		network_test.mode = _network_test_off;
 	if (network_test.mode == _network_test_off)
 		return;
 

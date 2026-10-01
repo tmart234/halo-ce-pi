@@ -167,6 +167,55 @@ static const struct config_setting config_settings[] =
 		"32-byte seed, raw or as 64 hexadecimal digits; empty for a new key each\n"
 		"run. A key in a file is a software key: a Verifier rates it no higher\n"
 		"than D1." },
+	{ "network.dedicated", _config_string, "\"\"", "HALO_DEDICATED", _environment_value, _platform_all,
+		"A dedicated host: hosts system link games with no player of its own,\n"
+		"on this map rotation, \"map[:variant],...\" (bloodgulch,\n"
+		"hangemhigh:ctf; slayer by default), for the players internet play\n"
+		"brings (with network.liveness, a region's verified playlists).\n"
+		"Empty for none (port/linux/game/network_dedicated.c)." },
+	{ "network.dedicated_min_players", _config_integer, "1", "HALO_DEDICATED_MIN_PLAYERS", _environment_value,
+		_platform_all,
+		"A dedicated host starts a game once this many players have joined." },
+	{ "network.dedicated_start", _config_real, "20.0", "HALO_DEDICATED_START", _environment_value, _platform_all,
+		"A dedicated host starts a game this many seconds after enough\n"
+		"players have joined (for the rest to join too)." },
+	{ "network.dedicated_postgame", _config_real, "15.0", "HALO_DEDICATED_POSTGAME", _environment_value,
+		_platform_all,
+		"A dedicated host goes back to its lobby, on the rotation's next map,\n"
+		"this many seconds after a game ends." },
+	{ "network.client_builds", _config_string, "\"\"", "HALO_NET_CLIENT_BUILDS", _environment_value, _platform_all,
+		"Hosting: the client builds admitted (SHA-256, 64 hexadecimal digits\n"
+		"each, comma-separated), as a joiner's Attestation Result measures\n"
+		"its build; empty for any. With a list, a joiner without a result\n"
+		"is refused." },
+	{ "network.banned_devices", _config_string, "\"\"", "HALO_NET_BANNED_DEVICES", _environment_value, _platform_all,
+		"Hosting: Device IDs refused (64 hexadecimal digits each,\n"
+		"comma-separated), as a joiner's Attestation Result names its device." },
+	{ "network.liveness", _config_string, "\"\"", "HALO_NET_LIVENESS", _environment_value, _platform_all,
+		"Hosting verified games (a dedicated host of a region's playlists):\n"
+		"Server Liveness's address, ip:port. Players then come matched by\n"
+		"the region's Broker (network.ticket_file), with no invite; empty\n"
+		"for invite games. Linux only." },
+	{ "network.game_address", _config_string, "\"\"", "HALO_NET_GAME_ADDRESS", _environment_value, _platform_all,
+		"Verified games: the address players dial, ip:port (this machine's,\n"
+		"at network.tunnel_port, when empty)." },
+	{ "network.key_bundle", _config_string, "\"keys/fpp_key_bundle.json\"", "HALO_NET_KEY_BUNDLE",
+		_environment_value, _platform_all,
+		"Verified games: the region's key bundle (fpp-cell bundle)." },
+	{ "network.ca_cert", _config_string, "\"keys/dev_ca.der\"", "HALO_NET_CA_CERT", _environment_value,
+		_platform_all,
+		"Verified games: the CA (DER) Server Liveness's certificate must\n"
+		"chain to." },
+	{ "network.gs_key_file", _config_string, "\"\"", "HALO_NET_GS_KEY", _environment_value, _platform_all,
+		"Verified games: the host's long-term key (32-byte seed, raw or 64\n"
+		"hexadecimal digits) Server Liveness knows it by; empty for one per run." },
+	{ "network.gs_tpm2", _config_boolean, "false", "HALO_NET_GS_TPM2", _environment_value, _platform_all,
+		"Verified games: prove this host's boot and build with its TPM 2.0\n"
+		"(tpm2-tools), as a region with a Build Registry requires." },
+	{ "network.ticket_file", _config_string, "\"\"", "HALO_NET_TICKET", _environment_value, _platform_all,
+		"Joining a verified game: the place the region's Broker gave this\n"
+		"machine (written by the mmo repository's fpp-ticket): the host is\n"
+		"dialled directly, and this machine's session key is the ticket's." },
 	{ "network.stun_servers", _config_string, "\"stun.l.google.com:19302,stun.cloudflare.com:3478\"",
 		"HALO_NET_STUN", _environment_value, _platform_all,
 		"Public STUN servers that tell this machine its internet address;\n"

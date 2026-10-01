@@ -15,18 +15,30 @@ host that leaves out outcomes is caught from the player's bundle.
 
 --trust tests the host's trust policy instead (network.minimum_tier 2): a
 joiner with a D2 Attestation Result bound to its session key is admitted;
-one with a D1 result, one with none, and one presenting the first's result
-under its own key are refused. The results come from the SDK's development
+one with a D1 result, one with none, one presenting the first's result
+under its own key, one whose device the host bans (network.banned_devices,
+finding H08) and one whose build it does not list (network.client_builds,
+H07) are refused. The results come from the SDK's development
 Verifier (cargo run -p fpp-ffi --example mint_ar, in the mmo checkout
 tools/fpp_sdk.py builds from), so it needs Rust.
+
+--verified tests a verified playlist (stage H5) instead: a development cell
+of the region's services (the mmo checkout's dev-cell), a host blessed by
+its Server Liveness (network.liveness), and players with tickets
+from its Verifier and Broker (fpp-ticket). A player whose build the host
+lists is admitted, checks the host's SAR chain and Checkpoints, and plays;
+one with another build is refused (finding H07); when the cell goes away
+the host is no longer blessed, and its player leaves.
 
     python tools/p2p_loopback_test.py [--binary build/linux/halo] [--trust]
 """
 
 import argparse
+import hashlib
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -68,10 +80,16 @@ def mmo_checkout() -> Path:
     return fpp_sdk.source_checkout()
 
 
-def mint(*args: str) -> str:
-    """the SDK's development Verifier (examples/mint_ar.rs)"""
+def mint(*args: str, did: str = "", build: str = "") -> str:
+    """the SDK's development Verifier (examples/mint_ar.rs); an AR's Device
+    ID and client build if given"""
+    env = dict(os.environ)
+    if did:
+        env["MINT_AR_DID"] = did
+    if build:
+        env["MINT_AR_BUILD"] = build
     result = subprocess.run(["cargo", "run", "-q", "--release", "--locked", "-p", "fpp-ffi", "--example", "mint_ar",
-                             "--", *args], cwd=mmo_checkout(), check=True, capture_output=True, text=True)
+                             "--", *args], cwd=mmo_checkout(), check=True, capture_output=True, text=True, env=env)
     return result.stdout.strip()
 
 
@@ -81,23 +99,30 @@ def trust_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
     verifier = secrets.token_hex(32)
     work.mkdir(parents=True, exist_ok=True)
     joiners = {}
-    for name in ("trusted", "low", "none", "stolen"):
+    # the host's lists: its release build, and a banned device (H07, H08)
+    build, banned = "c0" * 32, "dd" * 32
+    for name in ("trusted", "low", "none", "stolen", "banned", "modified"):
         seed = secrets.token_hex(32)
         (work / f"{name}.seed").write_text(seed)
         joiners[name] = {"seed": seed, "public": mint("session", seed)}
-    mint("ar", verifier, joiners["trusted"]["public"], "2", str(work / "trusted.ar"))
-    mint("ar", verifier, joiners["low"]["public"], "1", str(work / "low.ar"))
+    mint("ar", verifier, joiners["trusted"]["public"], "2", str(work / "trusted.ar"), build=build)
+    mint("ar", verifier, joiners["low"]["public"], "1", str(work / "low.ar"), build=build)
+    mint("ar", verifier, joiners["banned"]["public"], "2", str(work / "banned.ar"), build=build, did=banned)
+    mint("ar", verifier, joiners["modified"]["public"], "2", str(work / "modified.ar"), build="0e" * 32)
     processes = []
     try:
         host = start(args.binary, work / "host", {**common, "HALO_NET_ADDRESS": "127.0.0.200",
                                                   "HALO_NETWORK_TEST": "host:bloodgulch",
                                                   "HALO_NET_MINIMUM_TIER": "2",
+                                                  "HALO_NET_CLIENT_BUILDS": build,
+                                                  "HALO_NET_BANNED_DEVICES": banned,
                                                   "HALO_NET_VERIFIER_KEYS": mint("key", verifier)}, [])
         processes.append(host)
         invite = wait_for(work / "host" / "stdout.txt", INVITE.pattern, 20)
         if not invite:
             return ["the host made no invite"]
-        attestations = {"trusted": "trusted.ar", "low": "low.ar", "none": "", "stolen": "trusted.ar"}
+        attestations = {"trusted": "trusted.ar", "low": "low.ar", "none": "", "stolen": "trusted.ar",
+                        "banned": "banned.ar", "modified": "modified.ar"}
         for index, name in enumerate(joiners):
             env = {**common, "HALO_NET_ADDRESS": f"127.0.0.{201 + index}", "HALO_NETWORK_TEST": "join",
                    "HALO_NET_SESSION_KEY": str(work / f"{name}.seed")}
@@ -113,13 +138,15 @@ def trust_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
             ("host", r"refused player \w+: no attestation"),
             ("stolen", r"host \w+: could not verify this device's attestation"),
             ("host", r"refused player \w+: its attestation does not verify \(token: bound to another session key\)"),
+            ("host", r"refused player \w+: its device is banned"),
+            ("host", r"refused player \w+: its client build is not one network.client_builds lists"),
         ]
         for name, pattern in checks:
             found = wait_for(work / name / "stdout.txt", pattern, 30)
             print(f"{'ok  ' if found else 'FAIL'} {name}: {pattern}")
             if not found:
                 failures.append(f"{name} never logged {pattern!r}")
-        for name in ("low", "none", "stolen"):
+        for name in ("low", "none", "stolen", "banned", "modified"):
             if "connected to host" in (work / name / "stdout.txt").read_text(errors="replace"):
                 failures.append(f"{name} was admitted")
         players = len(re.findall(r"connected to player", (work / "host" / "stdout.txt").read_text(errors="replace")))
@@ -199,6 +226,109 @@ def evidence_test(args: argparse.Namespace, work: Path, common: dict) -> List[st
     return failures
 
 
+def cargo_build(*packages: str) -> None:
+    """binaries of the mmo checkout"""
+    command = ["cargo", "build", "-q", "--locked"]
+    for package in packages:
+        command += ["-p", package]
+    subprocess.run(command, cwd=mmo_checkout(), check=True)
+
+
+def verified_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
+    """a verified playlist: a dev cell, a dedicated host it blesses, and
+    players matched by its Broker"""
+    failures: List[str] = []
+    mmo = mmo_checkout()
+    # (the cell's services, its runner, and the players' ticket tool)
+    cargo_build("svc-liveness", "svc-verifier", "svc-broker", "svc-revocation", "svc-evidence", "svc-log",
+                "fpp-svc", "tools", "client-core")
+    cell_dir = work / "cell"
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    keys = cell_dir / "keys"
+    processes: List[subprocess.Popen] = []
+    cell = subprocess.Popen([str(mmo / "target/debug/dev-cell")], cwd=cell_dir,
+                            stdout=open(cell_dir / "stdout.txt", "w"), stderr=subprocess.STDOUT)
+    try:
+        if not wait_for(cell_dir / "stdout.txt", r"\[dev-cell\] ready", 60):
+            return ["the dev cell did not start"]
+        build = hashlib.sha256(args.binary.read_bytes()).hexdigest()
+        game_address = "127.0.0.200:47400"
+        host = start(args.binary, work / "host", {
+            **common, "HALO_NET_ADDRESS": "127.0.0.200", "HALO_NETWORK_TEST": "host:bloodgulch",
+            "HALO_NET_LIVENESS": "127.0.0.1:4444", "HALO_NET_GAME_ADDRESS": game_address,
+            "HALO_NET_TUNNEL_PORT": "47400", "HALO_NET_KEY_BUNDLE": str(keys / "fpp_key_bundle.json"),
+            "HALO_NET_CA_CERT": str(keys / "dev_ca.der"), "HALO_NET_CLIENT_BUILDS": build}, [])
+        processes.append(host)
+        if not wait_for(work / "host" / "stdout.txt", r"Verified play: blessed by Server Liveness", 30):
+            return ["the host was not blessed by Server Liveness"]
+
+        def ticket(name: str, client_build: str) -> Optional[Path]:
+            path = work / f"{name}.ticket"
+            result = subprocess.run([str(mmo / "target/debug/fpp-ticket"), "--client-build", client_build,
+                                     "--out", str(path)], cwd=cell_dir, capture_output=True, text=True)
+            print(result.stdout.strip() or result.stderr.strip())
+            return path if result.returncode == 0 else None
+
+        tickets = {"player": ticket("player", build), "modified": ticket("modified", "ab" * 32)}
+        for name, path in tickets.items():
+            if not path:
+                failures.append(f"no ticket for {name}")
+        if failures:
+            return failures
+        for index, (name, path) in enumerate(tickets.items()):
+            processes.append(start(args.binary, work / name, {
+                **common, "HALO_NET_ADDRESS": f"127.0.0.{201 + index}", "HALO_NETWORK_TEST": "join",
+                "HALO_NET_TICKET": str(path)}, []))
+        checks = [
+            ("player", r"Verified play: the host's SAR verifies"),
+            ("host", r"Verified play: admitted player \d+ to slot \d+: a D0 linux device"),
+            ("player", r"Verified play: admitted to slot \d+"),
+            ("player", r"Internet play: connected to host \w+ \(secure session\)"),
+            ("player", r"Verified play: the host's Checkpoint \d+ verifies \(2 so far"),
+            ("modified", r"Verified play: the host refused this machine: client build not admitted"),
+            ("host", r"Verified play: refused player \d+: client build not admitted"),
+        ]
+        for name, pattern in checks:
+            found = wait_for(work / name / "stdout.txt", pattern, 40)
+            print(f"{'ok  ' if found else 'FAIL'} {name}: {pattern}")
+            if not found:
+                failures.append(f"{name} never logged {pattern!r}")
+        if "connected to host" in (work / "modified" / "stdout.txt").read_text(errors="replace"):
+            failures.append("the modified build was admitted")
+        # the region's services go away: the host is not blessed any more,
+        # and its player does not stay
+        cell.send_signal(signal.SIGINT)
+        cell.wait(20)
+        gone = time.monotonic()
+        lapsed = wait_for(work / "player" / "stdout.txt",
+                          r"(SAR lapsed|not blessed \(SAR lapsed\))", 20)
+        took = time.monotonic() - gone
+        print(f"{'ok  ' if lapsed else 'FAIL'} player: left the host once it was no longer blessed ({took:.1f} s)")
+        if not lapsed:
+            failures.append("the player stayed with a host that is no longer blessed")
+        unblessed = wait_for(work / "host" / "stdout.txt", r"this host is no longer blessed", 10)
+        print(f"{'ok  ' if unblessed else 'FAIL'} host: knows it is no longer blessed")
+        if not unblessed:
+            failures.append("the host did not notice it lost its blessing")
+        elif took > 10:
+            failures.append(f"the player left {took:.1f} s after the host lost its blessing (more than one SAR lifetime)")
+    finally:
+        if cell.poll() is None:
+            cell.send_signal(signal.SIGINT)
+            try:
+                cell.wait(20)
+            except subprocess.TimeoutExpired:
+                cell.kill()
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            try:
+                process.wait(10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+    return failures
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", type=Path, default=Path("build/linux/halo"))
@@ -208,6 +338,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--synthetic", default="", help="(development) debug.evidence_synthetic for both copies")
     parser.add_argument("--evidence", action="store_true",
                         help="test the host's evidence and its audit instead (needs Rust: fpp-audit)")
+    parser.add_argument("--verified", action="store_true",
+                        help="test a verified playlist instead (needs Rust: the mmo checkout's dev cell)")
     args = parser.parse_args(argv)
 
     work = args.work or Path(tempfile.mkdtemp(prefix="p2p_loopback_"))
@@ -226,8 +358,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
     if args.synthetic:
         common["HALO_EVIDENCE_SYNTHETIC"] = args.synthetic
-    if args.trust or args.evidence:
-        failures = trust_test(args, work, common) if args.trust else evidence_test(args, work, common)
+    if args.trust or args.evidence or args.verified:
+        if args.trust:
+            failures = trust_test(args, work, common)
+        elif args.evidence:
+            failures = evidence_test(args, work, common)
+        else:
+            failures = verified_test(args, work, common)
         print(f"logs: {work}")
         for failure in failures:
             print(f"FAIL: {failure}")
