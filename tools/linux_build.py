@@ -427,6 +427,7 @@ def generate_linux_build(n: Writer, sln: Any) -> None:
             f"-I{KCP_DIR}",
             f"-I{fpp_sdk.INCLUDE}",
             "-DHALO_FPP",
+            *(["-DFPP_GS_LINK"] if "gs-link" in fpp_sdk.FEATURES["linux"] else []),
             "-Isource -Isource/cseries",
             sdk_flags,
         ])

@@ -409,6 +409,69 @@ Unity's Netcode for Entities, lightyear, netfox and the Ares source):
   the target was as far back as that round trip, instead of against where
   it is now with a wide margin.
 
+## Verified playlists and dedicated hosts
+
+An invite game is hosted by a player, who is omnipotent in it (finding
+H09: the evidence above proves what such a host did, but cannot stop it).
+A region's *verified playlists*, the mmo framework's stage H5, are hosted
+instead by dedicated hosts its trust plane vouches for, and their players
+are matched to them by its services (`port/linux/src/p2p_verified.c`):
+
+- **The host** (`network.liveness`, Server Liveness's address; Linux, whose
+  fpp SDK has its gs-link part) joins Server Liveness when its game starts
+  hosting, with its long-term key (`network.gs_key_file`) and, where it has
+  one, its TPM's evidence of its boot and build (`network.gs_tpm2`). Server
+  Liveness gives it a match and, every two seconds while it stays blessed,
+  a Server Attestation Result (SAR), chained to the last, that certifies the
+  key its Checkpoints are signed with and the key of its end of the secure
+  sessions. There is no invite: the region's Broker sends players to the
+  address it dials (`network.game_address`, by default this machine's at
+  `network.tunnel_port`).
+- **A player** gets a place from the region's Verifier and Broker (the mmo
+  repository's `fpp-ticket` writes it to `network.ticket_file`: a session
+  key, the host's address and key, an Attestation Result and a Session
+  Admission Token), dials the host directly, checks every SAR the host
+  relays (signed by Server Liveness, chained, naming the key it dialled and
+  the key the host signs with) and presents its tokens. It leaves the host
+  the moment the chain breaks, or no SAR comes for six seconds: a host that
+  lost its blessing keeps no players, even one that ignores losing it.
+- **Admission** is the SDK's (`fpp_admission_admit`): the tokens are signed
+  by the region's Broker and Verifier, for this host and match, bound to
+  the key the player's session proved, of the device tier the host asks
+  (`network.minimum_tier`), not revoked, and used once. The host's lists
+  apply on top: the client builds it admits, as the Attestation Result
+  measures them (`network.client_builds`; finding H07, a build identity a
+  modified client cannot claim where the platform measures it), and devices
+  it bans by their Device ID (`network.banned_devices`; finding H08, a ban
+  that sticks where the Verifier derives the ID from hardware). Revocation
+  events Server Liveness relays from the Revocation Feed remove the players
+  they name. Only then does the game see the player. Both lists also apply
+  to an invite game's trust policy, to the Attestation Result a joiner
+  presents there.
+- **The logged chain.** Every five seconds the host signs a Checkpoint for
+  Server Liveness, which logs it in the region's Transparency Log, and sends
+  it to every player, who checks it under the key the SAR certifies: the
+  roster, and the digest of each evidence Checkpoint signed since the last.
+  The evidence keeps its own match and epochs (game time), so no two
+  Checkpoints are ever signed for one match and epoch, and the logged chain
+  anchors the evidence.
+
+`network.dedicated` (`port/linux/game/network_dedicated.c`) makes a host
+dedicated: it hosts system link games with no player of its own, on a map
+rotation (`"bloodgulch,hangemhigh:ctf"`), starts a game
+`network.dedicated_start` seconds after `network.dedicated_min_players`
+players have joined, and after `network.dedicated_postgame` seconds on the
+postgame screen goes back to its lobby on the next map. The engine has
+always had a player on the hosting machine, so this needs testing with the
+game's data; the tests below have none.
+
+`tools/p2p_loopback_test.py --verified` runs a verified playlist on one
+computer without game data: the mmo repository's development cell
+(`dev-cell`), a host it blesses, a player matched by its Broker (admitted,
+checking the host's SARs and Checkpoints), one whose client build the host
+does not list (refused), and the cell stopped: the host knows it is no
+longer blessed, and its player leaves within one SAR lifetime.
+
 ## Testing
 
 `debug.network_test` (`port/linux/game/network_test.c`) hosts or joins a

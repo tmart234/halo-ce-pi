@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "https://github.com/tmart234/mmo.git"
 # the mmo commit whose crates/fpp-ffi this port uses (and whose fpp.h is
 # vendored); raised by `bump` (below), not by hand
-COMMIT = "482b30c193383fcc5730fc9fbffc8adf5f4cbd48"
+COMMIT = "e004d50aa2c1cacf9aff41c7d1aa6e12d3353ddd"
 HEADER = ROOT / "port/third_party/fpp/include/fpp.h"
 INCLUDE = HEADER.parent
 THIRD_PARTY = ROOT / "build/third_party"
@@ -53,9 +53,16 @@ TARGETS = {
     "linux": ("i686-unknown-linux-gnu", "libfpp.a"),
     "windows": ("i686-pc-windows-msvc", "fpp.lib"),
 }
+# the SDK's optional parts each port builds: on Linux, a dedicated host's
+# link to Server Liveness (gs-link: verified playlists, port/linux/src/
+# p2p_verified.c), which the game then compiles in (FPP_GS_LINK)
+FEATURES = {
+    "linux": ["gs-link"],
+    "windows": [],
+}
 # what the Rust standard library in libfpp needs from the system
 # (cargo rustc -- --print native-static-libs)
-LINUX_LIBRARIES = ["gcc_s", "util", "rt", "dl"]
+LINUX_LIBRARIES = ["gcc_s", "util", "rt", "pthread", "m", "dl"]
 WINDOWS_LIBRARIES = ["bcrypt", "advapi32", "kernel32", "ntdll", "userenv", "ws2_32", "dbghelp"]
 # the C runtime each port links: the Windows build's clang (not clang-cl)
 # links the static one (libcmt), so the SDK must too
@@ -173,8 +180,9 @@ def build(platform: str) -> Path:
     try:
         # (the static library alone: the crate's cdylib would need the
         # target's linker, which a cross build does not have)
+        features = ["--features", ",".join(FEATURES[platform])] if FEATURES[platform] else []
         _run(["cargo", "rustc", "--release", "--locked", "-p", "fpp-ffi", "--lib", "--crate-type", "staticlib",
-              "--target", target, "--target-dir", str(target_dir)], source)
+              *features, "--target", target, "--target-dir", str(target_dir)], source)
     finally:
         os.environ.pop("RUSTFLAGS", None)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,42 @@ run it after using another SDK call.
 
 #include "fpp.h"
 
+enum FppStatus fpp_admission_admit(struct FppAdmission *admission, const uint8_t *sat, size_t sat_len, const uint8_t *ar, size_t ar_len, const uint8_t *session_key, size_t session_key_len, uint64_t now_s, struct FppAdmitted *out)
+{
+	(void)admission;
+	(void)sat;
+	(void)sat_len;
+	(void)ar;
+	(void)ar_len;
+	(void)session_key;
+	(void)session_key_len;
+	(void)now_s;
+	(void)out;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_admission_poll_removed(struct FppAdmission *admission, uint16_t *slot, uint16_t *reason)
+{
+	(void)admission;
+	(void)slot;
+	(void)reason;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_admission_remove(struct FppAdmission *admission, uint16_t slot)
+{
+	(void)admission;
+	(void)slot;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_admission_tick(struct FppAdmission *admission, uint64_t now_s)
+{
+	(void)admission;
+	(void)now_s;
+	return FPP_STATUS_INTERNAL;
+}
+
 enum FppStatus fpp_ar_verify(const uint8_t *ar, size_t len, const uint8_t *verifier_keys, size_t verifier_key_count, const uint8_t *session_public_key, uint64_t now_s, uint8_t minimum_tier, struct FppArInfo *info)
 {
 	(void)ar;
@@ -48,6 +84,14 @@ enum FppStatus fpp_checkpoint_add_input(struct FppCheckpointBuilder *builder, ui
 	return FPP_STATUS_INTERNAL;
 }
 
+enum FppStatus fpp_checkpoint_add_roster(struct FppCheckpointBuilder *builder, const uint8_t *data, size_t len)
+{
+	(void)builder;
+	(void)data;
+	(void)len;
+	return FPP_STATUS_INTERNAL;
+}
+
 enum FppStatus fpp_checkpoint_begin(const uint8_t *match_id, const uint8_t *build_id, uint64_t policy_ver, uint32_t epoch, uint32_t first_tick, uint32_t last_tick, const uint8_t *prev, struct FppCheckpointBuilder **out)
 {
 	(void)match_id;
@@ -70,6 +114,68 @@ enum FppStatus fpp_checkpoint_sign(const struct FppCheckpointBuilder *builder, c
 {
 	(void)builder;
 	(void)instance_key;
+	(void)out;
+	(void)cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_control_admit(const uint8_t *sat, size_t sat_len, const uint8_t *ar, size_t ar_len, uint8_t *out, size_t cap, size_t *out_len)
+{
+	(void)sat;
+	(void)sat_len;
+	(void)ar;
+	(void)ar_len;
+	(void)out;
+	(void)cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_control_admitted(uint16_t slot, uint32_t start_tick, uint8_t *out, size_t cap, size_t *out_len)
+{
+	(void)slot;
+	(void)start_tick;
+	(void)out;
+	(void)cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_control_checkpoint_head(const uint8_t *checkpoint, size_t len, uint8_t *out, size_t cap, size_t *out_len)
+{
+	(void)checkpoint;
+	(void)len;
+	(void)out;
+	(void)cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_control_decode(const uint8_t *message, size_t len, struct FppControl *out, uint8_t *data, size_t cap)
+{
+	(void)message;
+	(void)len;
+	(void)out;
+	(void)data;
+	(void)cap;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_control_refuse(uint16_t code, uint8_t kick, uint8_t *out, size_t cap, size_t *out_len)
+{
+	(void)code;
+	(void)kick;
+	(void)out;
+	(void)cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_control_sar_update(const uint8_t *sar, size_t len, uint8_t *out, size_t cap, size_t *out_len)
+{
+	(void)sar;
+	(void)len;
 	(void)out;
 	(void)cap;
 	(void)out_len;
@@ -119,6 +225,20 @@ enum FppStatus fpp_input_commit_sign(const struct FppInputCommitBuilder *builder
 	return FPP_STATUS_INTERNAL;
 }
 
+enum FppStatus fpp_keys_add(struct FppKeys *keys, uint32_t role, const uint8_t *public_key)
+{
+	(void)keys;
+	(void)role;
+	(void)public_key;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_keys_new(struct FppKeys **out)
+{
+	*out = NULL;
+	return FPP_STATUS_INTERNAL;
+}
+
 enum FppStatus fpp_object_digest(const uint8_t *object, size_t len, uint8_t *out)
 {
 	(void)object;
@@ -144,6 +264,15 @@ enum FppStatus fpp_p2p_host_new(const uint8_t *static_private, const uint8_t *in
 	(void)hello_len;
 	(void)max_peers;
 	*out = NULL;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_p2p_host_peer_session_key(const struct FppP2pHost *host, uint32_t peer, uint8_t *out, size_t *out_len)
+{
+	(void)host;
+	(void)peer;
+	(void)out;
+	(void)out_len;
 	return FPP_STATUS_INTERNAL;
 }
 
@@ -294,6 +423,50 @@ enum FppStatus fpp_p2p_keypair_generate(uint8_t *private_out, uint8_t *public_ou
 {
 	(void)private_out;
 	(void)public_out;
+	return FPP_STATUS_INTERNAL;
+}
+
+const char *fpp_reason_str(uint16_t code)
+{
+	(void)code;
+	return "no SDK in this build";
+}
+
+void fpp_sar_chain_free(struct FppSarChain *chain)
+{
+	(void)chain;
+}
+
+enum FppStatus fpp_sar_chain_info(const struct FppSarChain *chain, struct FppSarInfo *info)
+{
+	(void)chain;
+	(void)info;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_sar_chain_live(const struct FppSarChain *chain, uint64_t now_s)
+{
+	(void)chain;
+	(void)now_s;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_sar_chain_start(const struct FppKeys *keys, const uint8_t *sar, size_t len, uint64_t now_s, struct FppSarChain **out)
+{
+	(void)keys;
+	(void)sar;
+	(void)len;
+	(void)now_s;
+	*out = NULL;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_sar_chain_update(struct FppSarChain *chain, const uint8_t *sar, size_t len, uint64_t now_s)
+{
+	(void)chain;
+	(void)sar;
+	(void)len;
+	(void)now_s;
 	return FPP_STATUS_INTERNAL;
 }
 

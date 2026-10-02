@@ -10,6 +10,8 @@ p2p_discord.c; see p2p.c for the design).
 
 #include "p2p.h"
 
+#include <stddef.h>
+
 enum
 {
 	/* a machine's identifier: random, and also its XNADDR's abEnet */
@@ -75,6 +77,54 @@ void p2p_instance_public_key(unsigned char *key);
 int p2p_peer_index_for_address(unsigned long address);
 /* sends the peer an evidence message on its session's reliable channel */
 int p2p_evidence_send(int peer, const void *data, int size);
+
+/* what p2p_verified.c asks of a peer (its index): a player admitted (the
+host lets the game see it), or a host that admitted this machine; a peer
+refused or removed with a fpp_types::Reason code; a player's session key
+(as fpp_p2p_host_peer_session_key gives it) */
+void p2p_peer_admit(int peer);
+void p2p_peer_refuse(int peer, unsigned short reason);
+int p2p_peer_session_key(int peer, unsigned char *key, size_t *size);
+
+/* ---------- p2p_verified.c: verified playlists (stage H5) */
+
+/* the host: whether it hosts verified games (network.liveness); joins
+Server Liveness when its game starts hosting (its sessions' static key,
+and the address players dial); whether it is blessed now */
+int p2p_verified_hosting(void);
+int p2p_verified_host_start(const unsigned char *noise_public_key, const char *game_address);
+int p2p_verified_host_ready(void);
+/* each pass of the p2p thread */
+void p2p_verified_host_update(void);
+/* a player's session is up (it is sent the SAR, and must Admit), gone, or
+admitted; a reliable message of a player's: whether it was a control
+message, taken */
+void p2p_verified_host_joined(int peer);
+void p2p_verified_host_left(int peer);
+int p2p_verified_host_admitted(int peer);
+int p2p_verified_host_message(int peer, const unsigned char *data, int size);
+/* p2p_evidence.c signed a Checkpoint: the next logged one anchors it */
+void p2p_verified_anchor(const unsigned char *digest);
+/* the title's lists (network.client_builds, network.banned_devices), for
+an invite game's trust policy too */
+int p2p_verified_builds_listed(void);
+int p2p_verified_build_admitted(const unsigned char *build);
+int p2p_verified_device_banned(const unsigned char *did);
+
+/* a player with a ticket (network.ticket_file): its session key's seed,
+the host to dial and its key */
+int p2p_verified_ticket_seed(unsigned char *seed);
+int p2p_verified_ticket_host(struct p2p_candidate *address, unsigned char *host_key);
+/* its session with the host: started, up (the instance key the host
+announced), messages (whether taken), whether admitted, checked each pass,
+gone */
+void p2p_verified_joiner_started(int peer);
+void p2p_verified_joiner_connected(int peer, const unsigned char *instance_key);
+int p2p_verified_joiner(int peer);
+int p2p_verified_joiner_message(int peer, const unsigned char *data, int size);
+int p2p_verified_joiner_admitted(int peer);
+void p2p_verified_joiner_update(int peer);
+void p2p_verified_joiner_gone(int peer);
 
 /* ---------- p2p_evidence.c: what a host was sent and decided (stage H4) */
 

@@ -42,6 +42,9 @@ int p2p_incoming(int stream, unsigned long *address, unsigned short *port);
 peer; returns their count */
 int p2p_broadcast_targets(unsigned short port, unsigned long *addresses, unsigned short *ports, int maximum_count);
 
+/* the players connected to this host through the tunnel (admitted, in a
+verified game) */
+int p2p_player_count(void);
 /* the game listens (it is hosting) on socket, or closes a socket */
 void p2p_socket_listening(int socket);
 void p2p_socket_closed(int socket);
