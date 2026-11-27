@@ -142,6 +142,7 @@ Kinds and reasons:
 | --- | --- |
 | `hit_report_rejected` | `not_its_player`, `bad_target`, `weapon_not_carried`, `forged_flags`, `forged_area`, `forged_scale`, `target_not_there`, `impact_off_target`, `obstructed`, `melee_out_of_reach`, `rate`, `bad_damage` |
 | `position_report_ignored` | `host_authority`: a machine kept sending position reports more than 3 seconds' worth after the host said it decides. A client of this version stops once it has the host's first state. |
+| `aim_anomaly` | `impossible_snap`: a player's client-reported aim angle snapped `> 120°` in a single 33 ms tick immediately before a valid weapon hit (pure server-side `DET-03` telemetry; never alters damage). |
 
 The host writes each machine's kind and reason at most once a second, with
 the count since its last line, so a modified client cannot flood the file.
@@ -176,8 +177,8 @@ there is a false reject to fix.
 `scale` and `multiplier` (ten times the damage), `kill` (kill instantly),
 `area` (a bullet as an explosion). The host rejects each.
 
-Two more red-team switches (debug builds) show what host authority does
-not fix, for the stages that do:
+Three more red-team switches (debug builds) prove what the higher FPP layers
+enforce:
 
 - `debug.cheat_radar`: a client that logs, every second, each player that
   no line through the level reaches from its own, with where the host says
@@ -191,6 +192,12 @@ not fix, for the stages that do:
   unhurt, and nothing they can check at the time shows why. Only evidence
   of what the host was sent and what it decided (stage H4: signed inputs,
   host checkpoints and a replay auditor) proves it.
+- `debug.cheat_host_equivocate`: a verified host that submits an honest
+  Checkpoint to Server Liveness / Transparency Log while sending a
+  conflicting signed Checkpoint to players from epoch 1 onward. Verified
+  clients with `network.trust_authority` prove the split view via
+  `fpp_tlog_check_checkpoint` and submit `fpp_tlog_report_equivocation` so
+  Server Liveness revokes the host immediately.
 
 Against the cheating host, internet play's evidence (stage H4,
 `port/linux/src/p2p_evidence.c`) records what each player sent the host
@@ -226,10 +233,12 @@ A client that reads its own memory knows whatever the host tells it. With
 client only of the players its own players could perceive, the mmo
 framework's stage H6 (finding H06, the built-in wallhack):
 
-- in the set of the level's parts that the client's players' parts can see
-  (the same test that decides how often a player is sent);
 - within 32 world units of one of them: the motion tracker's reach (25) and
   a margin, and where footsteps and gunfire are heard;
+- beyond 32 units, both in a PVS-visible level cluster **and** passing a
+  per-pair solid-structure BSP raycast from viewer eye to target head/chest
+  (plus ±0.5 wu horizontal corner-peek offsets, ignoring glass and fences so
+  peeking never pops in);
 - a teammate (team games), or the flag's or ball's carrier (on every HUD);
 - dead, or while the client's players are all dead (a spectator watches
   anyone).
@@ -242,12 +251,9 @@ place comes. Nothing else of it is sent: no states, no relayed input. The
 vehicle a player rides is sent a client only when one of its riders is.
 
 What a client still learns: where a withheld player was when the host
-stopped (the unit stays there, hidden); players within 32 units behind a
-wall (a wallhack there shows what the motion tracker nearly does); and the
-players in parts of the level the visibility test cannot rule out (it is
-coarse: a part sees another if any of it might). Damage effects, sounds
-and kill messages still name players as before. A line test per pair, as a
-finer filter, is future work.
+stopped (the unit stays there, hidden), and players within 32 units behind a
+wall (where the motion tracker and audio already operate). Damage effects,
+sounds and kill messages still name players as before.
 
 ## Joining a game in progress
 

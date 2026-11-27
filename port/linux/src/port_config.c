@@ -214,8 +214,15 @@ static const struct config_setting config_settings[] =
 		"(tpm2-tools), as a region with a Build Registry requires." },
 	{ "network.ticket_file", _config_string, "\"\"", "HALO_NET_TICKET", _environment_value, _platform_all,
 		"Joining a verified game: the place the region's Broker gave this\n"
-		"machine (written by the mmo repository's fpp-ticket): the host is\n"
+		"machine (written by the mmo repository's fppd ticket): the host is\n"
 		"dialled directly, and this machine's session key is the ticket's." },
+	{ "network.trust_authority", _config_string, "\"\"", "HALO_NET_TRUST_AUTHORITY", _environment_value, _platform_all,
+		"Verified games: regional fppd authority address (ip:port) for direct\n"
+		"in-client Verifier/Broker admission (when network.ticket_file is empty)\n"
+		"and client-side Transparency Log Checkpoint audit + split-view revocation." },
+	{ "network.queue", _config_string, "\"open\"", "HALO_NET_QUEUE", _environment_value, _platform_all,
+		"Verified games: matchmaking queue or playlist name requested from fppd\n"
+		"Broker when using network.trust_authority." },
 	{ "network.stun_servers", _config_string, "\"stun.l.google.com:19302,stun.cloudflare.com:3478\"",
 		"HALO_NET_STUN", _environment_value, _platform_all,
 		"Public STUN servers that tell this machine its internet address;\n"
@@ -277,6 +284,10 @@ static const struct config_setting config_settings[] =
 		"(debug builds only: a red-team host for tests) the host drops the clients'\n"
 		"hits on its own players after checking them, and counts them as dealt, as\n"
 		"a cheating host would (NETCODE.md)." },
+	{ "debug.cheat_host_equivocate", _config_boolean, "false", "HALO_CHEAT_HOST_EQUIVOCATE", _environment_set_is_true, _platform_all,
+		"(debug builds only: a red-team host for tests) verified host submits an\n"
+		"honest Checkpoint to Server Liveness and sends a conflicting signed\n"
+		"Checkpoint to players from epoch 1 onward (split-view attack, EVD-03)." },
 	{ "debug.test_input", _config_string, "\"\"", "HALO_TEST_INPUT", _environment_value, _platform_all,
 		"\"bot:<seed>\" plays controller 1 with a scripted pattern (automated\n"
 		"network tests); empty for none." },
