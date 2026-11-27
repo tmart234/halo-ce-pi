@@ -75,6 +75,34 @@ The game can play system link games on a local network and on the internet:
   and the host makes the decisions for the game. Refer to
   [port/linux/NETCODE.md](port/linux/NETCODE.md).
 
+## Fairness & Security Requirements (`mmo` Reference Title)
+
+This fork serves as the full-capability reference title for the
+[`mmo` Fair-Play Protocol (FPP v1)](https://github.com/tmart234/mmo) framework.
+
+> **Modification Scope Rule (`FR-00`):** Changes to the Halo: CE engine in this
+> fork exist **solely** to harden security, enforce cryptographic authority and
+> trust, or maximize competitive fairness (plus cross-platform determinism
+> required for audit) — **never** to alter legitimate Halo: CE gameplay, balance,
+> or physics.
+
+Every game-engine and networking modification introduced by this fork is
+tracked as a verifiable requirement below:
+
+| ID | Requirement | Mitigates / FPP | Implementation | Verification |
+| --- | --- | --- | --- | --- |
+| **FR-01** | **Host-authoritative movement & vehicles:** host ignores client position reports, simulates units/vehicles strictly from buffered client input ticks, stamps `input_tick`, and clients reconcile prediction error. | `H01` · `AUTH-01`, `AUTH-02` (speed/teleport/wall-step) | `network.authority = "host"` ([`network_distributed.c`](port/linux/game/network_distributed.c), [`network_objects.c`](port/linux/game/network_objects.c), [`player_queues_new.c`](source/game/player_queues_new.c)) | `tools/network_soak.py --scenario movement` |
+| **FR-02** | **Host-validated combat & line-of-sight:** host validates shooter ownership, carried weapon, fire rate, lag-compensated target bounds, unobstructed level-geometry raycast, melee reach (`<= 4` wu), and strict damage flags/area/scale/multiplier bounds. | `H02` · `AUTH-03`, `AUTH-04` (wall-shooting, forged damage/kills) | [`network_damage.c`](port/linux/game/network_damage.c) | `tools/network_soak.py` (`wall_hits`, `forged_*`, `soak`) |
+| **FR-03** | **Anti-ESP server-side relevance filtering:** host withholds enemy player states, occupied vehicles, and relayed inputs outside each client's potentially visible set and 32-wu audio/motion-tracker radius (with 15-tick hysteresis). | `H06` · `INFO-01` (memory-reader radar/wallhack) | `network.relevance = "true"` ([`network_distributed.c`](port/linux/game/network_distributed.c), [`network_objects.c`](port/linux/game/network_objects.c)) | `tools/network_soak.py --scenario radar` |
+| **FR-04** | **Structured server-side cheat Signals:** every rejected hit report and ignored position report emits rate-limited JSONL telemetry (`signals.jsonl`) instead of a silent drop. | `AUTH-04`, `DET-01` | [`network_signals.c`](port/linux/game/network_signals.c) | `tools/network_soak.py` (0 false rejects in `soak`) |
+| **FR-05** | **Authenticated per-peer Noise IK transport & zero hand-rolled crypto:** every tunnel pair negotiates forward-secret `Noise_IK_25519_ChaChaPoly_SHA256` with counter replay protection and path-migration challenges; signalling and hashing use the pure-Rust FPP C SDK (`p2p_crypto.c` deleted). | `H03`, `H04`, `H05` · `PROTO-03`, `PROTO-04`, `SEC-01` | [`p2p.c`](port/linux/src/p2p.c), [`p2p_signal.c`](port/linux/src/p2p_signal.c), [`fpp.h`](port/third_party/fpp/include/fpp.h) | `tools/p2p_loopback_test.py` + `mmo` `ffi-c-test-i686` |
+| **FR-06** | **Cryptographic match evidence & offline host audit:** clients sign per-epoch `InputCommit`s (hit reports) and hosts sign hash-chained `Checkpoint`s (outcomes) into `.fppb` bundles audited by `fppd audit` to catch cheating hosts dropping hits. | `H09` · `EVD-01`, `EVD-04`, `EVD-05` (host immunity/omission) | [`p2p_evidence.c`](port/linux/src/p2p_evidence.c) | `tools/p2p_loopback_test.py --evidence`, `tools/network_soak.py --scenario host_immunity` |
+| **FR-07** | **Hardware trust tier, build allowlist & Device ID bans:** hosts verify Verifier-signed Attestation Results (`fpp_ar_verify` / `fpp_admission_admit`), enforcing minimum device tier, measured `network.client_builds`, and hardware-rooted `network.banned_devices` + live Revocation Feed events. | `H07`, `H08` · `ATT-06`, `ATT-10`, `ID-02`, `ENF-01` | [`p2p.c`](port/linux/src/p2p.c), [`p2p_verified.c`](port/linux/src/p2p_verified.c) | `tools/p2p_loopback_test.py --trust` |
+| **FR-08** | **Verified dedicated playlists with continuous SAR blessing:** headless dedicated hosts link to `fppd` Server Liveness (`fpp_gs_link_*`), anchor evidence Checkpoints in the hybrid Transparency Log, admit Broker-ticketed players (`fppd ticket`), and clients disconnect within one SAR lifetime (10 s) if blessing lapses. | `H09` · `ATT-08`, `EVD-02`, `ENF-03` (rogue host) | [`network_dedicated.c`](port/linux/game/network_dedicated.c), [`p2p_verified.c`](port/linux/src/p2p_verified.c) | `tools/p2p_loopback_test.py --verified` |
+
+Full technical details and debug-only red-team test switches live in
+[port/linux/NETCODE.md](port/linux/NETCODE.md).
+
 ## Build the game
 
 You do not need the Xbox SDK. The port supplies the SDK declarations that
