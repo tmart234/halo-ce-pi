@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REPOSITORY = "https://github.com/tmart234/mmo.git"
 # the mmo commit whose crates/fpp-ffi this port uses (and whose fpp.h is
 # vendored); raised by `bump` (below), not by hand
-COMMIT = "44ad22055c7cba8fce6f0e2a0c3dadfadda0a222"
+COMMIT = "b704a0ef4fe4f1f6ccc553abb249198cb17a80ed"
 HEADER = ROOT / "port/third_party/fpp/include/fpp.h"
 INCLUDE = HEADER.parent
 THIRD_PARTY = ROOT / "build/third_party"
@@ -63,7 +63,7 @@ FEATURES = {
 # what the Rust standard library in libfpp needs from the system
 # (cargo rustc -- --print native-static-libs)
 LINUX_LIBRARIES = ["gcc_s", "util", "rt", "pthread", "m", "dl"]
-WINDOWS_LIBRARIES = ["bcrypt", "advapi32", "kernel32", "ntdll", "userenv", "ws2_32", "dbghelp"]
+WINDOWS_LIBRARIES = ["bcrypt", "advapi32", "kernel32", "ntdll", "userenv", "ws2_32", "dbghelp", "synchronization"]
 # the C runtime each port links: the Windows build's clang (not clang-cl)
 # links the static one (libcmt), so the SDK must too
 RUSTFLAGS = {

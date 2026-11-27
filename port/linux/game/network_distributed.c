@@ -60,6 +60,7 @@ machine (their datum identifiers need not be).
 #include "networking/network_game_globals.h"
 #include "objects/objects.h"
 #include "objects/damage.h"
+#include "physics/collisions.h"
 #include "scenario/scenario.h"
 #include "structures/structure_bsp_definitions.h"
 #include "units/units.h"
@@ -392,6 +393,31 @@ static struct
 	real average;
 	real deviation;
 } distributed_round_trips[HALO_PORT_MAXIMUM_NETWORK_MACHINES];
+/* (the host, DET-03) per-player client-reported facing history for
+server-side aim-kinematics anomaly telemetry (signals.jsonl only; never
+alters gameplay) */
+static struct
+{
+	boolean valid;
+	long last_tick;
+	real last_yaw;
+	real last_pitch;
+	long snap_tick;
+} distributed_aim_history[MAXIMUM_TRACKED_PLAYERS];
+
+boolean distributed_player_recent_aim_snap(
+	short player_index)
+{
+	long now;
+
+	if (player_index < 0 || player_index >= MAXIMUM_TRACKED_PLAYERS)
+		return FALSE;
+	if (!distributed_aim_history[player_index].valid || distributed_aim_history[player_index].snap_tick == NONE)
+		return FALSE;
+	now = game_time_get();
+	return now >= distributed_aim_history[player_index].snap_tick &&
+		now - distributed_aim_history[player_index].snap_tick <= 3;
+}
 
 /* the unreliable messages of this tick, a batch for each machine and one
 for the host */
@@ -1399,6 +1425,37 @@ static void distributed_handle_inputs(
 			continue;
 		update_server_handle_distributed_input(DATUM_INDEX_NEW(input->player_index, player->identifier), input->tick,
 			&input->action, input->control_flags, DISTRIBUTED_INPUT_HISTORY);
+		/* (DET-03) track server-observed single-tick view angle delta for
+		aim-anomaly telemetry when the player is alive */
+		if (input->player_index < MAXIMUM_TRACKED_PLAYERS && distributed_living_unit(player) != NONE)
+		{
+			real yaw = input->action.desired_facing.yaw;
+			real pitch = input->action.desired_facing.pitch;
+			long now = game_time_get();
+
+			if (distributed_aim_history[input->player_index].valid &&
+				now > distributed_aim_history[input->player_index].last_tick &&
+				now - distributed_aim_history[input->player_index].last_tick <= 2)
+			{
+				real dyaw = yaw - distributed_aim_history[input->player_index].last_yaw;
+				real dpitch = pitch - distributed_aim_history[input->player_index].last_pitch;
+
+				while (dyaw > 3.14159265f)
+					dyaw -= 6.28318530f;
+				while (dyaw < -3.14159265f)
+					dyaw += 6.28318530f;
+				if (dyaw * dyaw + dpitch * dpitch > 2.1f * 2.1f)
+					distributed_aim_history[input->player_index].snap_tick = now;
+			}
+			else if (!distributed_aim_history[input->player_index].valid)
+			{
+				distributed_aim_history[input->player_index].snap_tick = NONE;
+			}
+			distributed_aim_history[input->player_index].valid = TRUE;
+			distributed_aim_history[input->player_index].last_tick = now;
+			distributed_aim_history[input->player_index].last_yaw = yaw;
+			distributed_aim_history[input->player_index].last_pitch = pitch;
+		}
 		if (input->host_time != NONE && machine_index >= 0 && machine_index < HALO_PORT_MAXIMUM_NETWORK_MACHINES)
 		{
 			long sample = game_time_get() - input->host_time;
@@ -1434,6 +1491,68 @@ static short distributed_object_cluster(
 	while (object->object.parent_object_index != NONE)
 		object = object_get(object->object.parent_object_index);
 	return object->object.location.cluster_index;
+}
+
+/* (the host, network.relevance / INFO-01) per-pair solid-structure ray test
+from viewer eye to target head/chest (plus small horizontal corner-peek
+margin so stepping around corners never pops in). Tests solid one-sided level
+surfaces only: ignores objects, invisible player clip, breakable glass, and
+two-sided fences/grates */
+static boolean distributed_line_of_sight(
+	real_point3d const *viewer,
+	real_point3d const *target)
+{
+	unsigned long flags =
+		FLAG(_collision_test_structure_bit) |
+		FLAG(_collision_test_front_facing_surfaces_bit) |
+		FLAG(_collision_test_ignore_invisible_surfaces_bit) |
+		FLAG(_collision_test_ignore_breakable_surfaces_bit) |
+		FLAG(_collision_test_ignore_two_sided_surfaces_bit);
+	real_point3d eye;
+	real dx;
+	real dy;
+	real horiz;
+	real px = 0.0f;
+	real py = 0.0f;
+	real_point3d samples[4];
+	short index;
+
+	eye.x = viewer->x;
+	eye.y = viewer->y;
+	eye.z = viewer->z + 0.6f;
+	dx = target->x - viewer->x;
+	dy = target->y - viewer->y;
+	horiz = (real)sqrt(dx * dx + dy * dy);
+	if (horiz > 0.001f)
+	{
+		px = (-dy / horiz) * 0.5f;
+		py = (dx / horiz) * 0.5f;
+	}
+	/* head, chest, and +/-0.5 wu corner-peek shoulder offsets */
+	samples[0].x = target->x;
+	samples[0].y = target->y;
+	samples[0].z = target->z + 0.65f;
+	samples[1].x = target->x;
+	samples[1].y = target->y;
+	samples[1].z = target->z + 0.35f;
+	samples[2].x = target->x + px;
+	samples[2].y = target->y + py;
+	samples[2].z = target->z + 0.5f;
+	samples[3].x = target->x - px;
+	samples[3].y = target->y - py;
+	samples[3].z = target->z + 0.5f;
+	for (index = 0; index < 4; index++)
+	{
+		struct collision_result collision;
+		real_vector3d vector;
+
+		vector.i = samples[index].x - eye.x;
+		vector.j = samples[index].y - eye.y;
+		vector.k = samples[index].z - eye.z;
+		if (!collision_test_vector(flags, &eye, &vector, NONE, &collision))
+			return TRUE;
+	}
+	return FALSE;
 }
 
 /* the player's input as the host's tick ran it, in fewer bytes; whether
@@ -1626,19 +1745,25 @@ static void distributed_host_send_players(
 					/* (outside the map's clusters: in sight, to be safe) */
 					if (from < 0 || from >= cluster_count || to < 0 || to >= cluster_count || scenario_test_pvs(from, to))
 					{
-						real along = dx * viewer_aims[index].i + dy * viewer_aims[index].j + dz * viewer_aims[index].k;
+						boolean in_sight = !relevance || distance_squared < RELEVANCE_RADIUS * RELEVANCE_RADIUS ||
+							distributed_line_of_sight(&viewers[index], &origins[player_index]);
 
-						visible = TRUE;
-						/* aimed near: the cosine of the angle off the aim, compared
-						squared (along / distance >= cosine) */
-						if (along > 0.0f && along * along >= SCOPED_AT_COSINE * SCOPED_AT_COSINE * distance_squared &&
-							viewer_scoped[index])
+						if (in_sight)
 						{
-							aimed_period = 1;
-						}
-						else if (along > 0.0f && along * along >= AIMED_AT_COSINE * AIMED_AT_COSINE * distance_squared)
-						{
-							aimed_period = MIN(aimed_period, 2);
+							real along = dx * viewer_aims[index].i + dy * viewer_aims[index].j + dz * viewer_aims[index].k;
+
+							visible = TRUE;
+							/* aimed near: the cosine of the angle off the aim, compared
+							squared (along / distance >= cosine) */
+							if (along > 0.0f && along * along >= SCOPED_AT_COSINE * SCOPED_AT_COSINE * distance_squared &&
+								viewer_scoped[index])
+							{
+								aimed_period = 1;
+							}
+							else if (along > 0.0f && along * along >= AIMED_AT_COSINE * AIMED_AT_COSINE * distance_squared)
+							{
+								aimed_period = MIN(aimed_period, 2);
+							}
 						}
 					}
 				}
@@ -2011,6 +2136,7 @@ void network_distributed_new_game(
 	csmemset(distributed_seat_disagreements, 0, sizeof(distributed_seat_disagreements));
 	csmemset(distributed_predictions, 0, sizeof(distributed_predictions));
 	csmemset(distributed_round_trips, 0, sizeof(distributed_round_trips));
+	csmemset(distributed_aim_history, 0, sizeof(distributed_aim_history));
 	csmemset(distributed_seen, 0, sizeof(distributed_seen));
 	csmemset(distributed_relevant, 0, sizeof(distributed_relevant));
 	csmemset(distributed_relevant_until, 0, sizeof(distributed_relevant_until));

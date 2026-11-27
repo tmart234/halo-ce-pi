@@ -522,16 +522,22 @@ static void host_checkpoint(void)
 {
 	FppCheckpointBuilder *builder = NULL;
 	unsigned char build_id[32];
+	unsigned char prev_before[32];
+	int had_prev = host.has_prev;
+	uint32_t epoch = host.epoch;
 	unsigned char object[MAXIMUM_TOKEN];
+	unsigned char client_object[MAXIMUM_TOKEN];
 	unsigned char message[MAXIMUM_TOKEN + 64];
-	size_t object_size, size;
+	size_t object_size, client_size, size;
 	int index;
 	int signed_ok;
 
 	memset(build_id, 0, sizeof(build_id));
+	if (had_prev)
+		memcpy(prev_before, host.prev, 32);
 	/* (its ticks: the game's 30 a second since the host was blessed) */
-	if (fpp_checkpoint_begin(host.match_id, build_id, 0, host.epoch, host.epoch * (SESSION_EPOCH_MS * 30 / 1000),
-		(host.epoch + 1) * (SESSION_EPOCH_MS * 30 / 1000) - 1, host.has_prev ? host.prev : NULL,
+	if (fpp_checkpoint_begin(host.match_id, build_id, 0, epoch, epoch * (SESSION_EPOCH_MS * 30 / 1000),
+		(epoch + 1) * (SESSION_EPOCH_MS * 30 / 1000) - 1, had_prev ? prev_before : NULL,
 		&builder) != FPP_STATUS_OK)
 	{
 		return;
@@ -568,7 +574,39 @@ static void host_checkpoint(void)
 	if (host.link)
 		fpp_gs_link_submit_checkpoint(host.link, object, object_size);
 #endif
-	if (fpp_control_checkpoint_head(object, object_size, message, sizeof(message), &size) == FPP_STATUS_OK)
+	memcpy(client_object, object, object_size);
+	client_size = object_size;
+#ifndef HALO_RELEASE
+	/* (red-team split-view host, EVD-03): submit the honest Checkpoint to
+	Server Liveness / Transparency Log, but show clients a conflicting signed
+	Checkpoint for the same (match_id, epoch) from epoch 1 onward */
+	if (epoch >= 1 && host.admitted_count > 0 && config_boolean("debug.cheat_host_equivocate"))
+	{
+		FppCheckpointBuilder *rogue = NULL;
+		unsigned char fake_state[32];
+
+		memset(fake_state, 0xee, sizeof(fake_state));
+		if (fpp_checkpoint_begin(host.match_id, build_id, 0, epoch, epoch * (SESSION_EPOCH_MS * 30 / 1000),
+			(epoch + 1) * (SESSION_EPOCH_MS * 30 / 1000) - 1, had_prev ? prev_before : NULL,
+			&rogue) == FPP_STATUS_OK)
+		{
+			fpp_checkpoint_set_state_root(rogue, fake_state);
+			if (fpp_checkpoint_sign(rogue, p2p_instance_key(), client_object, sizeof(client_object),
+				&client_size) == FPP_STATUS_OK)
+			{
+				platform_log("Verified play: cheat_host_equivocate sending conflicting Checkpoint %u to players",
+					(unsigned)epoch);
+			}
+			else
+			{
+				memcpy(client_object, object, object_size);
+				client_size = object_size;
+			}
+			fpp_checkpoint_free(rogue);
+		}
+	}
+#endif
+	if (fpp_control_checkpoint_head(client_object, client_size, message, sizeof(message), &size) == FPP_STATUS_OK)
 	{
 		for (index = 0; index < P2P_MAXIMUM_PEERS; index++)
 		{
@@ -696,6 +734,9 @@ static struct
 	unsigned char ar[MAXIMUM_TOKEN];
 	int ar_size;
 	unsigned char liveness_key[32];
+	/* optional fppd address & key bundle for Transparency Log split-view audit */
+	char authority[128];
+	char bundle[512];
 
 	int peer;
 	/* its session with the host is up */
@@ -710,12 +751,46 @@ static struct
 	long heads;
 	int has_match;
 	unsigned char match_id[16];
+#ifdef FPP_GS_LINK
+	/* pending Transparency Log Checkpoint audit (EVD-02 / EVD-03) */
+	int audit_pending;
+	uint32_t audit_epoch;
+	unsigned char audit_digest[32];
+	unsigned char audit_signed[MAXIMUM_TOKEN];
+	size_t audit_size;
+	unsigned long audit_time;
+	unsigned long audit_wait_ms;
+	int audit_attempts;
+#endif
 } ticket = { .peer = -1 };
 
-/* network.ticket_file: what fpp-ticket wrote */
+static int parse_ipv4_port(const char *value, unsigned long *address, unsigned short *port)
+{
+	unsigned int a, b, c, d, p;
+
+	if (sscanf(value, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &p) == 5 && a < 256 && b < 256 && c < 256 &&
+		d < 256 && p && p < 65536)
+	{
+		unsigned char bytes[4] = { (unsigned char)a, (unsigned char)b, (unsigned char)c, (unsigned char)d };
+		unsigned char port_bytes[2] = { (unsigned char)(p >> 8), (unsigned char)p };
+
+		/* (network byte order, as struct p2p_candidate holds it) */
+		memcpy(address, bytes, 4);
+		if (sizeof(*address) > 4)
+			memset((unsigned char *)address + 4, 0, sizeof(*address) - 4);
+		memcpy(port, port_bytes, 2);
+		return 1;
+	}
+	return 0;
+}
+
+/* network.ticket_file (written by fppd ticket) or direct in-client admission
+against network.trust_authority (fpp_client_admit) */
 static void load_ticket(void)
 {
 	const char *path = config_string("network.ticket_file");
+	const char *authority = config_string("network.trust_authority");
+	const char *bundle = config_string("network.key_bundle");
 	static char text[3 * MAXIMUM_TOKEN];
 	FILE *file;
 	size_t size;
@@ -723,8 +798,64 @@ static void load_ticket(void)
 	int have = 0;
 
 	ticket.checked = 1;
+	snprintf(ticket.authority, sizeof(ticket.authority), "%s", authority ? authority : "");
+	snprintf(ticket.bundle, sizeof(ticket.bundle), "%s", bundle ? bundle : "");
+
 	if (!path[0])
+	{
+#ifdef FPP_GS_LINK
+		if (ticket.authority[0])
+		{
+			static FppAdmittedTicket admitted;
+			FppClientAdmitConfig admit_cfg;
+			const char *queue = config_string("network.queue");
+			FppStatus status;
+
+			memset(&admit_cfg, 0, sizeof(admit_cfg));
+			admit_cfg.authority = ticket.authority;
+			admit_cfg.bundle = ticket.bundle;
+			admit_cfg.queue = (queue && queue[0]) ? queue : "open";
+			admit_cfg.timeout_ms = 20000;
+			status = fpp_client_admit(&admit_cfg, &admitted);
+			if (status != FPP_STATUS_OK)
+			{
+				platform_log("Verified play: direct admission via fppd %s failed (%s%s%s)",
+					ticket.authority, fpp_status_str((int)status),
+					admitted.reason ? ": " : "",
+					admitted.reason ? fpp_reason_str(admitted.reason) : "");
+				return;
+			}
+			if (!parse_ipv4_port(admitted.gs_addr, &ticket.address, &ticket.port) ||
+				admitted.sat_len > MAXIMUM_TOKEN || admitted.ar_len > MAXIMUM_TOKEN)
+			{
+				platform_log("Verified play: fppd returned unusable admission address %s", admitted.gs_addr);
+				return;
+			}
+			memcpy(ticket.seed, admitted.session_seed, 32);
+			memcpy(ticket.noise_static, admitted.gs_noise_static, 32);
+			memcpy(ticket.liveness_key, admitted.liveness_key, 32);
+			memcpy(ticket.sat, admitted.sat, admitted.sat_len);
+			ticket.sat_size = (int)admitted.sat_len;
+			memcpy(ticket.ar, admitted.ar, admitted.ar_len);
+			ticket.ar_size = (int)admitted.ar_len;
+			if (fpp_keys_new(&ticket.keys) != FPP_STATUS_OK ||
+				fpp_keys_add(ticket.keys, FPP_KEY_LIVENESS, ticket.liveness_key) != FPP_STATUS_OK)
+			{
+				platform_log("Verified play: fppd returned an invalid Server Liveness key");
+				return;
+			}
+			{
+				char did_hex[65];
+
+				p2p_hex(admitted.did, 32, did_hex);
+				platform_log("Verified play: admitted directly via fppd (%s, queue %s, slot %u, tier D%u, did %s)",
+					admitted.gs_addr, admit_cfg.queue, (unsigned)admitted.slot, (unsigned)admitted.tier, did_hex);
+			}
+			ticket.loaded = 1;
+		}
+#endif
 		return;
+	}
 	file = fopen(path, "rb");
 	if (!file)
 	{
@@ -748,24 +879,8 @@ static void load_ticket(void)
 		*value++ = 0;
 		if (!strcmp(line, "session_seed") && parse_hex(value, ticket.seed, 32, NULL) == 32)
 			have |= 1;
-		else if (!strcmp(line, "gs_addr"))
-		{
-			unsigned int a, b, c, d, port;
-
-			if (sscanf(value, "%u.%u.%u.%u:%u", &a, &b, &c, &d, &port) == 5 && a < 256 && b < 256 && c < 256 &&
-				d < 256 && port && port < 65536)
-			{
-				unsigned char bytes[4] = { (unsigned char)a, (unsigned char)b, (unsigned char)c, (unsigned char)d };
-				unsigned char port_bytes[2] = { (unsigned char)(port >> 8), (unsigned char)port };
-
-				/* (network byte order, as struct p2p_candidate holds it) */
-				memcpy(&ticket.address, bytes, 4);
-				if (sizeof(ticket.address) > 4)
-					memset((unsigned char *)&ticket.address + 4, 0, sizeof(ticket.address) - 4);
-				memcpy(&ticket.port, port_bytes, 2);
-				have |= 2;
-			}
-		}
+		else if (!strcmp(line, "gs_addr") && parse_ipv4_port(value, &ticket.address, &ticket.port))
+			have |= 2;
 		else if (!strcmp(line, "gs_noise_static") && parse_hex(value, ticket.noise_static, 32, NULL) == 32)
 			have |= 4;
 		else if (!strcmp(line, "sat") && (ticket.sat_size = parse_hex(value, ticket.sat, MAXIMUM_TOKEN, NULL)) > 0)
@@ -821,6 +936,9 @@ void p2p_verified_joiner_started(int peer)
 	ticket.sar_time = p2p_now();
 	fpp_sar_chain_free(ticket.chain);
 	ticket.chain = NULL;
+#ifdef FPP_GS_LINK
+	ticket.audit_pending = 0;
+#endif
 }
 
 void p2p_verified_joiner_connected(int peer, const unsigned char *instance_key)
@@ -841,6 +959,9 @@ static void joiner_lapse(int peer, const char *why)
 	fpp_sar_chain_free(ticket.chain);
 	ticket.chain = NULL;
 	ticket.peer = -1;
+#ifdef FPP_GS_LINK
+	ticket.audit_pending = 0;
+#endif
 	p2p_peer_refuse(peer, REASON_SAR_LAPSED);
 }
 
@@ -906,6 +1027,21 @@ static void joiner_head(int peer, const unsigned char *checkpoint, size_t size)
 	platform_log("Verified play: the host's Checkpoint %u verifies (%ld so far; roster %u, %u evidence anchored)",
 		(unsigned)checkpoint_info.epoch, ticket.heads, (unsigned)checkpoint_info.roster_n,
 		(unsigned)checkpoint_info.events_n);
+#ifdef FPP_GS_LINK
+	/* queue Transparency Log audit (C2SP signature + witness cosignature +
+	RFC 9162 Merkle inclusion proof; EVD-02 / EVD-03) when trust_authority is set */
+	if (ticket.authority[0] && ticket.bundle[0] && size <= MAXIMUM_TOKEN &&
+		fpp_object_digest(checkpoint, size, ticket.audit_digest) == FPP_STATUS_OK)
+	{
+		ticket.audit_pending = 1;
+		ticket.audit_epoch = checkpoint_info.epoch;
+		memcpy(ticket.audit_signed, checkpoint, size);
+		ticket.audit_size = size;
+		ticket.audit_time = p2p_now();
+		ticket.audit_wait_ms = 250;
+		ticket.audit_attempts = 0;
+	}
+#endif
 }
 
 int p2p_verified_joiner(int peer)
@@ -969,10 +1105,72 @@ void p2p_verified_joiner_update(int peer)
 		joiner_lapse(peer, "no SAR for six seconds");
 	else if (ticket.chain && fpp_sar_chain_live(ticket.chain, unix_seconds()) != FPP_STATUS_OK)
 		joiner_lapse(peer, "its SAR expired");
+#ifdef FPP_GS_LINK
+	if (p2p_verified_joiner(peer) && ticket.audit_pending && ticket.has_match &&
+		elapsed_since(ticket.audit_time, ticket.audit_wait_ms))
+	{
+		char authority[128];
+		char bundle[512];
+		unsigned char match_id[16];
+		uint32_t epoch = ticket.audit_epoch;
+		unsigned char digest[32];
+		unsigned char signed_cp[MAXIMUM_TOKEN];
+		size_t signed_len = ticket.audit_size;
+		FppTlogStatus tlog_status = FPP_TLOG_STATUS_PENDING;
+		unsigned char logged_digest[32];
+		uint8_t revoked = 0;
+		FppStatus st;
+
+		snprintf(authority, sizeof(authority), "%s", ticket.authority);
+		snprintf(bundle, sizeof(bundle), "%s", ticket.bundle);
+		memcpy(match_id, ticket.match_id, 16);
+		memcpy(digest, ticket.audit_digest, 32);
+		memcpy(signed_cp, ticket.audit_signed, signed_len);
+
+		p2p_lock_leave();
+		st = fpp_tlog_check_checkpoint(authority, bundle, match_id, epoch, digest, 2500,
+			&tlog_status, logged_digest);
+		if (st == FPP_STATUS_OK && tlog_status == FPP_TLOG_STATUS_SPLIT_VIEW)
+		{
+			fpp_tlog_report_equivocation(authority, bundle, signed_cp, signed_len, 2500, &revoked);
+		}
+		p2p_lock_enter();
+
+		if (st == FPP_STATUS_OK && tlog_status == FPP_TLOG_STATUS_INCLUDED)
+		{
+			platform_log("Verified play: Checkpoint %u proven logged in Transparency Log (witness cosigned + Merkle proof)",
+				(unsigned)epoch);
+			if (ticket.audit_pending && ticket.audit_epoch == epoch)
+				ticket.audit_pending = 0;
+		}
+		else if (st == FPP_STATUS_OK && tlog_status == FPP_TLOG_STATUS_SPLIT_VIEW)
+		{
+			platform_log("Verified play: SPLIT VIEW detected on Checkpoint %u; reporting equivocation to Server Liveness",
+				(unsigned)epoch);
+			if (revoked)
+				platform_log("Verified play: Server Liveness revoked equivocating host");
+			if (ticket.audit_pending && ticket.audit_epoch == epoch)
+				ticket.audit_pending = 0;
+		}
+		else if (ticket.audit_pending && ticket.audit_epoch == epoch)
+		{
+			ticket.audit_attempts++;
+			ticket.audit_time = p2p_now();
+			ticket.audit_wait_ms = 400;
+			if (ticket.audit_attempts >= 15)
+				ticket.audit_pending = 0;
+		}
+	}
+#endif
 }
 
 void p2p_verified_joiner_gone(int peer)
 {
 	if (peer == ticket.peer)
+	{
 		ticket.peer = -1;
+#ifdef FPP_GS_LINK
+		ticket.audit_pending = 0;
+#endif
+	}
 }

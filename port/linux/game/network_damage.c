@@ -1146,6 +1146,11 @@ void network_damage_handle_reports(
 			continue;
 		}
 		damage_dealt_reports++;
+		if (report->damage.owner_player_index != NO_PLAYER &&
+			distributed_player_recent_aim_snap(report->damage.owner_player_index))
+		{
+			network_signal("aim_anomaly", "impossible_snap", machine_index, report->damage.owner_player_index);
+		}
 		/* (the cheating host of stage H1 leaves the outcome out, which the
 		player's evidence shows: the auditor finds the report unaccounted) */
 		if (distributed_cheat_host_immunity(report->object_index))

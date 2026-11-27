@@ -235,8 +235,9 @@ def cargo_build(*packages: str) -> None:
 
 
 def verified_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
-    """a verified playlist: unified fppd authority, a dedicated host it blesses, and
-    players matched by its Broker"""
+    """a verified playlist: unified fppd authority, direct in-client admission,
+    Transparency Log witness+Merkle verification, live mid-match revocation kick,
+    split-view equivocation auto-revocation, and SAR lapse on authority loss"""
     failures: List[str] = []
     mmo = mmo_checkout()
     # One authority daemon + CLI binary replaces 9 legacy binaries
@@ -245,48 +246,62 @@ def verified_test(args: argparse.Namespace, work: Path, common: dict) -> List[st
     cell_dir = work / "cell"
     cell_dir.mkdir(parents=True, exist_ok=True)
     keys = cell_dir / "keys"
+    bundle_path = str(keys / "fpp_key_bundle.json")
+    vcommon = {**common, "HALO_EXIT_AFTER": str(max(args.seconds, 60.0))}
     processes: List[subprocess.Popen] = []
+    cells: List[subprocess.Popen] = []
     cell = subprocess.Popen([fppd, "serve"], cwd=cell_dir,
                             stdout=open(cell_dir / "stdout.txt", "w"), stderr=subprocess.STDOUT)
+    cells.append(cell)
     try:
         if not wait_for(cell_dir / "stdout.txt", r"\[fppd\] ready", 60):
             return ["fppd authority did not start"]
         build = hashlib.sha256(args.binary.read_bytes()).hexdigest()
         game_address = "127.0.0.200:47400"
         host = start(args.binary, work / "host", {
-            **common, "HALO_NET_ADDRESS": "127.0.0.200", "HALO_NETWORK_TEST": "host:bloodgulch",
+            **vcommon, "HALO_NET_ADDRESS": "127.0.0.200", "HALO_NETWORK_TEST": "host:bloodgulch",
             "HALO_NET_LIVENESS": "127.0.0.1:4444", "HALO_NET_GAME_ADDRESS": game_address,
-            "HALO_NET_TUNNEL_PORT": "47400", "HALO_NET_KEY_BUNDLE": str(keys / "fpp_key_bundle.json"),
+            "HALO_NET_TUNNEL_PORT": "47400", "HALO_NET_KEY_BUNDLE": bundle_path,
             "HALO_NET_CA_CERT": "", "HALO_NET_CLIENT_BUILDS": build}, [])
         processes.append(host)
         if not wait_for(work / "host" / "stdout.txt", r"Verified play: blessed by Server Liveness", 30):
             return ["the host was not blessed by Server Liveness"]
 
-        def ticket(name: str, client_build: str) -> Optional[Path]:
-            path = work / f"{name}.ticket"
-            result = subprocess.run([fppd, "ticket", "--client-build", client_build,
-                                     "--out", str(path)], cwd=cell_dir, capture_output=True, text=True)
-            print(result.stdout.strip() or result.stderr.strip())
-            return path if result.returncode == 0 else None
+        # 1) Direct in-client admission via fpp_client_admit (no external fppd ticket CLI)
+        #    + client-side Transparency Log witness+Merkle verification.
+        processes.append(start(args.binary, work / "player", {
+            **vcommon, "HALO_NET_ADDRESS": "127.0.0.201", "HALO_NETWORK_TEST": "join",
+            "HALO_NET_TRUST_AUTHORITY": "127.0.0.1:4444", "HALO_NET_KEY_BUNDLE": bundle_path,
+            "HALO_NET_QUEUE": "open"}, []))
 
-        tickets = {"player": ticket("player", build), "modified": ticket("modified", "ab" * 32)}
-        for name, path in tickets.items():
-            if not path:
-                failures.append(f"no ticket for {name}")
-        if failures:
-            return failures
-        for index, (name, path) in enumerate(tickets.items()):
-            processes.append(start(args.binary, work / name, {
-                **common, "HALO_NET_ADDRESS": f"127.0.0.{201 + index}", "HALO_NETWORK_TEST": "join",
-                "HALO_NET_TICKET": str(path)}, []))
+        # 2) Modified client build via fppd ticket: host must refuse it (H07).
+        modified_ticket = work / "modified.ticket"
+        res = subprocess.run([fppd, "ticket", "--client-build", "ab" * 32,
+                              "--out", str(modified_ticket)], cwd=cell_dir, capture_output=True, text=True)
+        print(res.stdout.strip() or res.stderr.strip())
+        if res.returncode != 0:
+            return ["no ticket for modified"]
+        processes.append(start(args.binary, work / "modified", {
+            **vcommon, "HALO_NET_ADDRESS": "127.0.0.202", "HALO_NETWORK_TEST": "join",
+            "HALO_NET_TICKET": str(modified_ticket)}, []))
+
+        # 3) Second honest player for live mid-match revocation kick (ENF-01 / ENF-02).
+        processes.append(start(args.binary, work / "banned", {
+            **vcommon, "HALO_NET_ADDRESS": "127.0.0.203", "HALO_NETWORK_TEST": "join",
+            "HALO_NET_TRUST_AUTHORITY": "127.0.0.1:4444", "HALO_NET_KEY_BUNDLE": bundle_path,
+            "HALO_NET_QUEUE": "open"}, []))
+
         checks = [
+            ("player", r"Verified play: admitted directly via fppd"),
             ("player", r"Verified play: the host's SAR verifies"),
             ("host", r"Verified play: admitted player \d+ to slot \d+: a D0 linux device"),
             ("player", r"Verified play: admitted to slot \d+"),
             ("player", r"Internet play: connected to host \w+ \(secure session\)"),
             ("player", r"Verified play: the host's Checkpoint \d+ verifies \(2 so far"),
+            ("player", r"Verified play: Checkpoint \d+ proven logged in Transparency Log \(witness cosigned \+ Merkle proof\)"),
             ("modified", r"Verified play: the host refused this machine: client build not admitted"),
             ("host", r"Verified play: refused player \d+: client build not admitted"),
+            ("banned", r"Internet play: connected to host \w+ \(secure session\)"),
         ]
         for name, pattern in checks:
             found = wait_for(work / name / "stdout.txt", pattern, 40)
@@ -295,8 +310,28 @@ def verified_test(args: argparse.Namespace, work: Path, common: dict) -> List[st
                 failures.append(f"{name} never logged {pattern!r}")
         if "connected to host" in (work / "modified" / "stdout.txt").read_text(errors="replace"):
             failures.append("the modified build was admitted")
-        # the region's services go away: the host is not blessed any more,
-        # and its player does not stay
+
+        # Fire live mid-match device ban via fppd enforce -> Halo must kick within 5 s.
+        did_match = wait_for(work / "banned" / "stdout.txt", r"admitted directly via fppd .*did ([0-9a-f]{64})", 10)
+        if not did_match:
+            failures.append("could not read banned player's Device ID from log")
+        else:
+            banned_did = did_match.group(1)
+            kick_start = time.monotonic()
+            enf = subprocess.run([fppd, "enforce", "ban-device", banned_did, "--note", "loopback-test"],
+                                 cwd=cell_dir, capture_output=True, text=True)
+            print(enf.stdout.strip() or enf.stderr.strip())
+            if enf.returncode != 0:
+                failures.append(f"fppd enforce ban-device failed ({enf.returncode})")
+            else:
+                kicked = wait_for(work / "banned" / "stdout.txt",
+                                  r"Verified play: the host removed this machine: revoked", 10)
+                kick_took = time.monotonic() - kick_start
+                print(f"{'ok  ' if kicked else 'FAIL'} banned: kicked live mid-match by fppd enforce ({kick_took:.2f} s)")
+                if not kicked:
+                    failures.append("banned player was not kicked live mid-match")
+
+        # 4) Authority disappears: host loses blessing and honest player leaves within one SAR lifetime.
         cell.send_signal(signal.SIGINT)
         cell.wait(20)
         gone = time.monotonic()
@@ -312,13 +347,55 @@ def verified_test(args: argparse.Namespace, work: Path, common: dict) -> List[st
             failures.append("the host did not notice it lost its blessing")
         elif took > 10:
             failures.append(f"the player left {took:.1f} s after the host lost its blessing (more than one SAR lifetime)")
+
+        # 5) Split-view equivocation detection & live auto-revocation (EVD-02 / EVD-03):
+        #    rogue_host submits honest Checkpoints to Server Liveness and sends conflicting
+        #    signed Checkpoints to watcher from epoch 1 onward; watcher proves split view
+        #    against the Transparency Log and Server Liveness revokes rogue_host automatically.
+        split_dir = work / "cell_split"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        split_bundle = str(split_dir / "keys" / "fpp_key_bundle.json")
+        split_cell = subprocess.Popen([fppd, "serve", "--bind", "127.0.0.1:4445"], cwd=split_dir,
+                                      stdout=open(split_dir / "stdout.txt", "w"), stderr=subprocess.STDOUT)
+        cells.append(split_cell)
+        if not wait_for(split_dir / "stdout.txt", r"\[fppd\] ready", 30):
+            failures.append("split-view fppd authority did not start")
+        else:
+            rogue_host = start(args.binary, work / "rogue_host", {
+                **vcommon, "HALO_NET_ADDRESS": "127.0.0.210", "HALO_NETWORK_TEST": "host:bloodgulch",
+                "HALO_NET_LIVENESS": "127.0.0.1:4445", "HALO_NET_GAME_ADDRESS": "127.0.0.210:47410",
+                "HALO_NET_TUNNEL_PORT": "47410", "HALO_NET_KEY_BUNDLE": split_bundle,
+                "HALO_NET_CA_CERT": "", "HALO_CHEAT_HOST_EQUIVOCATE": "1"}, [])
+            processes.append(rogue_host)
+            if not wait_for(work / "rogue_host" / "stdout.txt", r"Verified play: blessed by Server Liveness", 30):
+                failures.append("rogue_host was not blessed by Server Liveness")
+            else:
+                watcher = start(args.binary, work / "watcher", {
+                    **vcommon, "HALO_NET_ADDRESS": "127.0.0.211", "HALO_NETWORK_TEST": "join",
+                    "HALO_NET_TRUST_AUTHORITY": "127.0.0.1:4445", "HALO_NET_KEY_BUNDLE": split_bundle,
+                    "HALO_NET_QUEUE": "open"}, [])
+                processes.append(watcher)
+                split_checks = [
+                    ("watcher", r"Verified play: Checkpoint \d+ proven logged in Transparency Log"),
+                    ("rogue_host", r"Verified play: cheat_host_equivocate sending conflicting Checkpoint \d+"),
+                    ("watcher", r"Verified play: SPLIT VIEW detected on Checkpoint \d+; reporting equivocation to Server Liveness"),
+                    ("watcher", r"Verified play: Server Liveness revoked equivocating host"),
+                    ("rogue_host", r"this host is no longer blessed"),
+                    ("watcher", r"(the host removed this machine|SAR lapsed)"),
+                ]
+                for name, pattern in split_checks:
+                    found = wait_for(work / name / "stdout.txt", pattern, 40)
+                    print(f"{'ok  ' if found else 'FAIL'} {name}: {pattern}")
+                    if not found:
+                        failures.append(f"{name} never logged {pattern!r}")
     finally:
-        if cell.poll() is None:
-            cell.send_signal(signal.SIGINT)
-            try:
-                cell.wait(20)
-            except subprocess.TimeoutExpired:
-                cell.kill()
+        for c in cells:
+            if c.poll() is None:
+                c.send_signal(signal.SIGINT)
+                try:
+                    c.wait(20)
+                except subprocess.TimeoutExpired:
+                    c.kill()
         for process in processes:
             process.terminate()
         for process in processes:

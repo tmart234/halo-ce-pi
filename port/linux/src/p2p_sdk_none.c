@@ -132,6 +132,13 @@ void fpp_checkpoint_free(struct FppCheckpointBuilder *builder)
 	(void)builder;
 }
 
+enum FppStatus fpp_checkpoint_set_state_root(struct FppCheckpointBuilder *builder, const uint8_t *root)
+{
+	(void)builder;
+	(void)root;
+	return FPP_STATUS_INTERNAL;
+}
+
 enum FppStatus fpp_checkpoint_sign(const struct FppCheckpointBuilder *builder, const struct FppSigner *instance_key, uint8_t *out, size_t cap, size_t *out_len)
 {
 	(void)builder;
