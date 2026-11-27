@@ -352,7 +352,7 @@ Only machines with the invite can find the game:
 - The machines exchange their addresses through public MQTT brokers
   (`network.signalling_brokers`). The topics are HMACs of the token. A key
   from the token encrypts and authenticates the messages
-  (`src/p2p_signal.c`, `src/p2p_crypto.c`). The messages contain only
+  (`src/p2p_signal.c`, via `fpp.h`). The messages contain only
   addresses.
 
 A player with the invite cannot read or change the traffic of another
@@ -409,7 +409,7 @@ prove what the host did with its hits:
   or rejected with a reason. The host sends the Checkpoint to each player.
 - Each machine writes this evidence to `evidence/` in the data root, one
   file for each game.
-- `fpp-audit` (the `mmo` repository, `crates/fpp-audit`) checks a file.
+- `fppd audit` (the `mmo` repository, `crates/fppd`) checks a file.
   If the host did not acknowledge a signature, or gave no outcome for a hit
   report, the auditor finds it.
 

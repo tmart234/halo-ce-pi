@@ -1,7 +1,7 @@
 /*
 P2P_INTERNAL.H
 
-Shared internals of internet play (p2p.c, p2p_signal.c, p2p_crypto.c,
+Shared internals of internet play (p2p.c, p2p_signal.c,
 p2p_discord.c; see p2p.c for the design).
 */
 
@@ -158,23 +158,14 @@ void p2p_signal_stop_joining(void);
 /* whether any broker is connected */
 int p2p_signal_connected(void);
 
-/* ---------- p2p_crypto.c */
+/* ---------- crypto sizes (primitives live in the fpp SDK: fpp.h) */
 
 enum
 {
 	P2P_SHA256_SIZE = 32,
-	/* what p2p_seal adds: a 12-byte nonce and a 16-byte tag */
+	/* what fpp_aead_seal adds: a 12-byte nonce and a 16-byte tag */
 	P2P_SEAL_OVERHEAD = 28,
 };
-
-void p2p_sha256(const void *data, int size, unsigned char *digest);
-void p2p_hmac_sha256(const unsigned char *key, int key_size, const void *data, int size, unsigned char *digest);
-/* encrypts and authenticates plaintext with key into sealed (size +
-P2P_SEAL_OVERHEAD bytes); returns the sealed size */
-int p2p_seal(const unsigned char *key, const void *plaintext, int size, unsigned char *sealed);
-/* the reverse, if sealed was made with key: returns the plaintext size, or
--1 if it was not (or was altered) */
-int p2p_open(const unsigned char *key, const unsigned char *sealed, int size, unsigned char *plaintext);
 
 /* ---------- p2p_discord.c: rich presence and invites through the Discord
 desktop client */

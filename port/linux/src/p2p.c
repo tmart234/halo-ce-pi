@@ -13,7 +13,7 @@ link games as if they were on one LAN, without a server of this project's.
   without an invite there is no way to find or join it.
 - Signalling (p2p_signal.c) goes through public MQTT brokers, on topics
   that are hashes of the token, with messages sealed with a key derived
-  from it (p2p_crypto.c). A joiner offers the addresses it can be reached
+  from it (fpp.h). A joiner offers the addresses it can be reached
   at; the host answers with its own. Every invite holder can read these:
   they carry addresses, never keys.
 - The tunnel is one UDP socket. Each machine learns its public address from
@@ -571,7 +571,7 @@ static void identifier_from_key(const unsigned char *public_key, unsigned char *
 
 	memcpy(input, context, sizeof(context));
 	memcpy(input + sizeof(context), public_key, P2P_PUBLIC_KEY_SIZE);
-	p2p_sha256(input, sizeof(input), digest);
+	(void)fpp_sha256(input, sizeof(input), digest);
 	memcpy(out, digest, P2P_IDENTIFIER_SIZE);
 	out[0] = (unsigned char)((out[0] & 0xFC) | 0x02);
 }
@@ -654,7 +654,7 @@ static unsigned long virtual_address_for(const unsigned char *peer_identifier)
 	unsigned char digest[P2P_SHA256_SIZE];
 	unsigned long value;
 
-	p2p_sha256(peer_identifier, P2P_IDENTIFIER_SIZE, digest);
+	(void)fpp_sha256(peer_identifier, P2P_IDENTIFIER_SIZE, digest);
 	value = (unsigned long)digest[0] << 16 | (unsigned long)digest[1] << 8 | digest[2];
 	for (;;)
 	{
@@ -1021,7 +1021,7 @@ void p2p_peer_offered(const unsigned char *peer_identifier, const struct p2p_can
 		/* the session's invite secret, from the token (as the host makes it) */
 		memcpy(input, p2p.join_token, P2P_TOKEN_SIZE);
 		memcpy(input + P2P_TOKEN_SIZE, "halo-p2p-invite", 16);
-		p2p_sha256(input, sizeof(input), peer->invite_secret);
+		(void)fpp_sha256(input, sizeof(input), peer->invite_secret);
 	}
 	/* (asked again: it is still trying) */
 	if (!peer->connected)
@@ -2564,7 +2564,7 @@ static void update_hosting(void)
 			join, and is never a key */
 			memcpy(input, p2p.token, P2P_TOKEN_SIZE);
 			memcpy(input + P2P_TOKEN_SIZE, "halo-p2p-invite", 16);
-			p2p_sha256(input, sizeof(input), invite_secret);
+			(void)fpp_sha256(input, sizeof(input), invite_secret);
 			hello[0] = SESSION_HELLO_VERSION;
 			memcpy(hello + 1, identifier, P2P_IDENTIFIER_SIZE);
 			load_trust_policy();
