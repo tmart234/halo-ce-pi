@@ -53,6 +53,28 @@ enum FppStatus fpp_admission_tick(struct FppAdmission *admission, uint64_t now_s
 	return FPP_STATUS_INTERNAL;
 }
 
+enum FppStatus fpp_aead_open(const uint8_t *key, const uint8_t *sealed, size_t len, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+	(void)key;
+	(void)sealed;
+	(void)len;
+	(void)out;
+	(void)out_cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_aead_seal(const uint8_t *key, const uint8_t *plaintext, size_t len, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+	(void)key;
+	(void)plaintext;
+	(void)len;
+	(void)out;
+	(void)out_cap;
+	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
 enum FppStatus fpp_ar_verify(const uint8_t *ar, size_t len, const uint8_t *verifier_keys, size_t verifier_key_count, const uint8_t *session_public_key, uint64_t now_s, uint8_t minimum_tier, struct FppArInfo *info)
 {
 	(void)ar;
@@ -179,6 +201,16 @@ enum FppStatus fpp_control_sar_update(const uint8_t *sar, size_t len, uint8_t *o
 	(void)out;
 	(void)cap;
 	(void)out_len;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data, size_t len, uint8_t *out)
+{
+	(void)key;
+	(void)key_len;
+	(void)data;
+	(void)len;
+	(void)out;
 	return FPP_STATUS_INTERNAL;
 }
 
@@ -467,6 +499,14 @@ enum FppStatus fpp_sar_chain_update(struct FppSarChain *chain, const uint8_t *sa
 	(void)sar;
 	(void)len;
 	(void)now_s;
+	return FPP_STATUS_INTERNAL;
+}
+
+enum FppStatus fpp_sha256(const uint8_t *data, size_t len, uint8_t *out)
+{
+	(void)data;
+	(void)len;
+	(void)out;
 	return FPP_STATUS_INTERNAL;
 }
 

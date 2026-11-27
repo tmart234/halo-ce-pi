@@ -165,8 +165,8 @@ def trust_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
 
 
 def audit(bundles: List[Path]) -> subprocess.CompletedProcess:
-    """the SDK's evidence auditor (crates/fpp-audit), on bundles"""
-    return subprocess.run(["cargo", "run", "-q", "--release", "--locked", "-p", "fpp-audit", "--",
+    """the SDK's evidence auditor (fppd audit), on bundles"""
+    return subprocess.run(["cargo", "run", "-q", "--release", "--locked", "-p", "fppd", "--", "audit",
                            *(str(b.resolve()) for b in bundles)],
                           cwd=mmo_checkout(), capture_output=True, text=True)
 
@@ -235,36 +235,36 @@ def cargo_build(*packages: str) -> None:
 
 
 def verified_test(args: argparse.Namespace, work: Path, common: dict) -> List[str]:
-    """a verified playlist: a dev cell, a dedicated host it blesses, and
+    """a verified playlist: unified fppd authority, a dedicated host it blesses, and
     players matched by its Broker"""
     failures: List[str] = []
     mmo = mmo_checkout()
-    # (the cell's services, its runner, and the players' ticket tool)
-    cargo_build("svc-liveness", "svc-verifier", "svc-broker", "svc-revocation", "svc-evidence", "svc-log",
-                "fpp-svc", "tools", "client-core")
+    # One authority daemon + CLI binary replaces 9 legacy binaries
+    cargo_build("fppd")
+    fppd = str(mmo / "target/debug/fppd")
     cell_dir = work / "cell"
     cell_dir.mkdir(parents=True, exist_ok=True)
     keys = cell_dir / "keys"
     processes: List[subprocess.Popen] = []
-    cell = subprocess.Popen([str(mmo / "target/debug/dev-cell")], cwd=cell_dir,
+    cell = subprocess.Popen([fppd, "serve"], cwd=cell_dir,
                             stdout=open(cell_dir / "stdout.txt", "w"), stderr=subprocess.STDOUT)
     try:
-        if not wait_for(cell_dir / "stdout.txt", r"\[dev-cell\] ready", 60):
-            return ["the dev cell did not start"]
+        if not wait_for(cell_dir / "stdout.txt", r"\[fppd\] ready", 60):
+            return ["fppd authority did not start"]
         build = hashlib.sha256(args.binary.read_bytes()).hexdigest()
         game_address = "127.0.0.200:47400"
         host = start(args.binary, work / "host", {
             **common, "HALO_NET_ADDRESS": "127.0.0.200", "HALO_NETWORK_TEST": "host:bloodgulch",
             "HALO_NET_LIVENESS": "127.0.0.1:4444", "HALO_NET_GAME_ADDRESS": game_address,
             "HALO_NET_TUNNEL_PORT": "47400", "HALO_NET_KEY_BUNDLE": str(keys / "fpp_key_bundle.json"),
-            "HALO_NET_CA_CERT": str(keys / "dev_ca.der"), "HALO_NET_CLIENT_BUILDS": build}, [])
+            "HALO_NET_CA_CERT": "", "HALO_NET_CLIENT_BUILDS": build}, [])
         processes.append(host)
         if not wait_for(work / "host" / "stdout.txt", r"Verified play: blessed by Server Liveness", 30):
             return ["the host was not blessed by Server Liveness"]
 
         def ticket(name: str, client_build: str) -> Optional[Path]:
             path = work / f"{name}.ticket"
-            result = subprocess.run([str(mmo / "target/debug/fpp-ticket"), "--client-build", client_build,
+            result = subprocess.run([fppd, "ticket", "--client-build", client_build,
                                      "--out", str(path)], cwd=cell_dir, capture_output=True, text=True)
             print(result.stdout.strip() or result.stderr.strip())
             return path if result.returncode == 0 else None

@@ -25,6 +25,7 @@ A joiner repeats its JOIN until the tunnel reaches the host.
 #include "posix.h"
 #include "port_config.h"
 #include "p2p_internal.h"
+#include "fpp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,7 +147,7 @@ static void derive(const unsigned char *token, const char *label, const unsigned
 		memcpy(data + size, identifier, P2P_IDENTIFIER_SIZE);
 		size += P2P_IDENTIFIER_SIZE;
 	}
-	p2p_hmac_sha256(token, P2P_TOKEN_SIZE, data, size, digest);
+	(void)fpp_hmac_sha256(token, P2P_TOKEN_SIZE, data, (size_t)size, digest);
 }
 
 static void make_topic(const unsigned char *token, const char *label, const unsigned char *identifier,
@@ -405,8 +406,13 @@ static void send_join(void)
 	memcpy(message + size, signalling.join_nonce, NONCE_SIZE);
 	size += NONCE_SIZE;
 	size += put_candidates(message + size);
-	size = p2p_seal(signalling.join_key, message, size, sealed);
-	publish_everywhere(signalling.join_host_topic, sealed, size);
+	{
+		size_t sealed_size = 0;
+
+		if (fpp_aead_seal(signalling.join_key, message, (size_t)size, sealed, sizeof(sealed), &sealed_size) ==
+			FPP_STATUS_OK)
+			publish_everywhere(signalling.join_host_topic, sealed, (int)sealed_size);
+	}
 	signalling.join_sent_time = p2p_now();
 }
 
@@ -466,9 +472,16 @@ static void join_received(const unsigned char *message, int size)
 	memcpy(answer + answer_size, nonce, NONCE_SIZE);
 	answer_size += NONCE_SIZE;
 	answer_size += put_candidates(answer + answer_size);
-	answer_size = p2p_seal(signalling.host_key, answer, answer_size, sealed);
-	make_topic(signalling.host_token, "joiner", identifier, topic);
-	publish_everywhere(topic, sealed, answer_size);
+	{
+		size_t sealed_size = 0;
+
+		if (fpp_aead_seal(signalling.host_key, answer, (size_t)answer_size, sealed, sizeof(sealed), &sealed_size) ==
+			FPP_STATUS_OK)
+		{
+			make_topic(signalling.host_token, "joiner", identifier, topic);
+			publish_everywhere(topic, sealed, (int)sealed_size);
+		}
+	}
 }
 
 /* the joiner: the host answered */
@@ -492,21 +505,23 @@ static void accept_received(const unsigned char *message, int size)
 static void publish_received(const char *topic, const unsigned char *payload, int size)
 {
 	unsigned char message[MAXIMUM_MESSAGE_SIZE];
-	int message_size;
+	size_t message_size = 0;
 
-	if (size > MAXIMUM_MESSAGE_SIZE + P2P_SEAL_OVERHEAD)
+	if (size < 0 || size > MAXIMUM_MESSAGE_SIZE + P2P_SEAL_OVERHEAD)
 		return;
 	if (signalling.hosting && !strcmp(topic, signalling.host_topic))
 	{
-		message_size = p2p_open(signalling.host_key, payload, size, message);
-		if (message_size >= 2 && message[0] == _message_join && message[1] == MESSAGE_VERSION)
-			join_received(message, message_size);
+		if (fpp_aead_open(signalling.host_key, payload, (size_t)size, message, sizeof(message), &message_size) ==
+				FPP_STATUS_OK &&
+			message_size >= 2 && message[0] == _message_join && message[1] == MESSAGE_VERSION)
+			join_received(message, (int)message_size);
 	}
 	else if (signalling.joining && !strcmp(topic, signalling.join_topic))
 	{
-		message_size = p2p_open(signalling.join_key, payload, size, message);
-		if (message_size >= 2 && message[0] == _message_accept && message[1] == MESSAGE_VERSION)
-			accept_received(message, message_size);
+		if (fpp_aead_open(signalling.join_key, payload, (size_t)size, message, sizeof(message), &message_size) ==
+				FPP_STATUS_OK &&
+			message_size >= 2 && message[0] == _message_accept && message[1] == MESSAGE_VERSION)
+			accept_received(message, (int)message_size);
 	}
 }
 

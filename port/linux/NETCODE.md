@@ -196,7 +196,7 @@ Against the cheating host, internet play's evidence (stage H4,
 `port/linux/src/p2p_evidence.c`) records what each player sent the host
 reliably (its hit reports, signed each epoch) and what the host decided on
 each (an outcome in its signed Checkpoint). `debug.cheat_host_immunity`
-leaves its outcomes out, which the auditor (`fpp-audit`, in the mmo
+leaves its outcomes out, which the auditor (`fppd audit`, in the mmo
 repository) finds in the player's evidence. Evidence is kept only for
 internet play games (the secure sessions carry it), not the LAN.
 
@@ -428,7 +428,7 @@ are matched to them by its services (`port/linux/src/p2p_verified.c`):
   address it dials (`network.game_address`, by default this machine's at
   `network.tunnel_port`).
 - **A player** gets a place from the region's Verifier and Broker (the mmo
-  repository's `fpp-ticket` writes it to `network.ticket_file`: a session
+  repository's `fppd ticket` writes it to `network.ticket_file`: a session
   key, the host's address and key, an Attestation Result and a Session
   Admission Token), dials the host directly, checks every SAR the host
   relays (signed by Server Liveness, chained, naming the key it dialled and
@@ -466,8 +466,8 @@ always had a player on the hosting machine, so this needs testing with the
 game's data; the tests below have none.
 
 `tools/p2p_loopback_test.py --verified` runs a verified playlist on one
-computer without game data: the mmo repository's development cell
-(`dev-cell`), a host it blesses, a player matched by its Broker (admitted,
+computer without game data: the mmo repository's authority daemon
+(`fppd serve`), a host it blesses, a player matched by its Broker (admitted,
 checking the host's SARs and Checkpoints), one whose client build the host
 does not list (refused), and the cell stopped: the host knows it is no
 longer blessed, and its player leaves within one SAR lifetime.
